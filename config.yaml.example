@@ -1,0 +1,43 @@
+# Конфигурация проекта для анализа
+project:
+  name: "zayobushek"
+  path: "/Users/ruslanhafizov/Desktop/zayobushek"
+  
+  # Что индексировать для RAG (glob паттерны)
+  docs:
+    - "README.md"
+    - "docs/*.md"
+    - "MIGRATION_NOTES.md"
+    - "RAW_DATA_README.md"
+    - "VECTORIZATION_README.md"
+  
+  # Игнорировать
+  ignore:
+    - "node_modules"
+    - ".git"
+    - "build"
+    - "dist"
+
+# Настройки AI
+ai:
+  provider: "huggingface"
+  model: "Qwen/Qwen2.5-7B-Instruct"
+  api_key: "your_huggingface_api_key_here"
+  max_tokens: 2048
+  api_url: "https://router.huggingface.co/v1/chat/completions"
+
+# Настройки векторизации (Ollama)
+vectorization:
+  enabled: true
+  ollama_url: "http://localhost:11434"
+  model: "mxbai-embed-large"
+
+# Настройки сервера
+server:
+  port: 3002
+  host: "0.0.0.0"
+
+# Настройки Git MCP
+git:
+  enabled: true
+
