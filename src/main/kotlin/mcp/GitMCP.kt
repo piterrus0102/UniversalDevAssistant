@@ -1,5 +1,6 @@
 package mcp
 
+import kotlinx.serialization.Serializable
 import mu.KotlinLogging
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -10,8 +11,151 @@ private val logger = KotlinLogging.logger {}
 /**
  * Git MCP - Model Context Protocol для работы с Git
  * Выполняет git команды в контексте проекта
+ * 
+ * Реализует MCPServer для предоставления Git инструментов через MCP протокол
  */
-class GitMCP(private val projectPath: String) {
+class GitMCP(private val projectPath: String) : MCPServer {
+    
+    override suspend fun listTools(): MCPToolsResponse {
+        return MCPToolsResponse(
+            tools = listOf(
+                MCPTool(
+                    name = "get_git_status",
+                    description = "Получить текущий статус Git репозитория (измененные файлы, текущая ветка)",
+                    inputSchema = MCPToolSchema(
+                        type = "object",
+                        properties = emptyMap(),
+                        required = emptyList()
+                    )
+                ),
+                MCPTool(
+                    name = "get_git_branch",
+                    description = "Получить название текущей Git ветки",
+                    inputSchema = MCPToolSchema(
+                        type = "object",
+                        properties = emptyMap(),
+                        required = emptyList()
+                    )
+                ),
+                MCPTool(
+                    name = "get_git_commits",
+                    description = "Получить список последних коммитов",
+                    inputSchema = MCPToolSchema(
+                        type = "object",
+                        properties = mapOf(
+                            "limit" to MCPPropertySchema(
+                                type = "number",
+                                description = "Количество коммитов (по умолчанию 5)"
+                            )
+                        ),
+                        required = emptyList()
+                    )
+                ),
+                MCPTool(
+                    name = "get_git_diff",
+                    description = "Получить diff (изменения) для конкретного файла",
+                    inputSchema = MCPToolSchema(
+                        type = "object",
+                        properties = mapOf(
+                            "file" to MCPPropertySchema(
+                                type = "string",
+                                description = "Путь к файлу"
+                            )
+                        ),
+                        required = listOf("file")
+                    )
+                )
+            )
+        )
+    }
+    
+    override suspend fun callTool(name: String, args: Map<String, Any>): MCPToolResult {
+        logger.info { "🔧 GitMCP вызов инструмента: $name" }
+        
+        return when (name) {
+            "get_git_status" -> {
+                val info = getFullInfo()
+                val statusText = buildString {
+                    appendLine("Git Status:")
+                    appendLine("  Branch: ${info.currentBranch}")
+                    appendLine("  Last Commit: ${info.lastCommit}")
+                    appendLine("  Modified Files: ${info.modifiedFiles.size}")
+                    if (info.modifiedFiles.isNotEmpty()) {
+                        appendLine("  Files:")
+                        info.modifiedFiles.forEach { file ->
+                            appendLine("    - $file")
+                        }
+                    } else {
+                        appendLine("  (no changes)")
+                    }
+                }
+                
+                MCPToolResult(
+                    content = listOf(
+                        MCPContent(
+                            type = "text",
+                            text = statusText
+                        )
+                    )
+                )
+            }
+            
+            "get_git_branch" -> {
+                val branch = getCurrentBranch()
+                MCPToolResult(
+                    content = listOf(
+                        MCPContent(
+                            type = "text",
+                            text = "Текущая ветка: $branch"
+                        )
+                    )
+                )
+            }
+            
+            "get_git_commits" -> {
+                val limit = (args["limit"] as? Number)?.toInt() ?: 5
+                val commits = getRecentCommits(limit)
+                val commitsText = buildString {
+                    appendLine("Последние $limit коммитов:")
+                    commits.forEach { commit ->
+                        appendLine("  - $commit")
+                    }
+                }
+                
+                MCPToolResult(
+                    content = listOf(
+                        MCPContent(
+                            type = "text",
+                            text = commitsText
+                        )
+                    )
+                )
+            }
+            
+            "get_git_diff" -> {
+                val file = args["file"] as? String
+                    ?: throw IllegalArgumentException("Параметр 'file' обязателен")
+                
+                val diff = getDiff(file)
+                MCPToolResult(
+                    content = listOf(
+                        MCPContent(
+                            type = "text",
+                            text = if (diff.isBlank()) {
+                                "Нет изменений в файле $file"
+                            } else {
+                                "Diff для файла $file:\n$diff"
+                            }
+                        )
+                    )
+                )
+            }
+            
+            else -> {
+                throw IllegalArgumentException("Неизвестный инструмент: $name")
+            }
+        }
+    }
     
     /**
      * Получить текущую ветку
@@ -26,14 +170,7 @@ class GitMCP(private val projectPath: String) {
     fun getStatus(): String {
         return executeGit("status", "--short")
     }
-    
-    /**
-     * Получить полный статус
-     */
-    fun getFullStatus(): String {
-        return executeGit("status")
-    }
-    
+
     /**
      * Получить последние коммиты
      */
@@ -62,17 +199,7 @@ class GitMCP(private val projectPath: String) {
                 if (parts.size == 2) parts[1] else line
             }
     }
-    
-    /**
-     * Получить список всех веток
-     */
-    fun getBranches(): List<String> {
-        val output = executeGit("branch", "-a")
-        return output.lines()
-            .filter { it.isNotBlank() }
-            .map { it.trim().removePrefix("* ").trim() }
-    }
-    
+
     /**
      * Получить информацию о remote
      */
@@ -159,6 +286,7 @@ class GitMCP(private val projectPath: String) {
 /**
  * Модель данных с информацией о git репозитории
  */
+@Serializable
 data class GitInfo(
     val isGitRepo: Boolean,
     val currentBranch: String,

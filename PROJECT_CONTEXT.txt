@@ -268,7 +268,7 @@ WORKFLOW РАЗРАБОТКИ:
 
 Дополнительно сделано:
 ✅ Векторизация через Ollama (семантический поиск)
-✅ HuggingFace LLM вместо Claude
+✅ HuggingFace LLM (Qwen 2.5)
 ✅ Полная Git интеграция (status, log, commits)
 ✅ REST API с множеством endpoints
 ✅ Написано на Kotlin (не Node.js)

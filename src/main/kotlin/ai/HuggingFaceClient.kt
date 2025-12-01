@@ -1,6 +1,7 @@
 package ai
 
 import config.AIConfig
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -30,27 +31,19 @@ class HuggingFaceClient(private val config: AIConfig) {
     private val apiUrl = config.api_url ?: "https://router.huggingface.co/v1/chat/completions"
     
     /**
-     * Отправить вопрос к HuggingFace модели
+     * Отправить вопрос к HuggingFace модели (с историей сообщений)
      */
-    fun ask(prompt: String, systemPrompt: String? = null): String {
+    fun ask(messages: List<HFMessage>): String {
         logger.debug { "📤 Отправка запроса к HuggingFace API (${config.model})" }
-        logger.debug { "Prompt length: ${prompt.length} chars" }
+        logger.debug { "История: ${messages.size} сообщений" }
         
         try {
-            val messages = mutableListOf<HFMessage>()
-            
-            if (systemPrompt != null) {
-                messages.add(HFMessage(role = "system", content = systemPrompt))
-            }
-            
-            messages.add(HFMessage(role = "user", content = prompt))
-            
             val requestBody = HFRequest(
                 model = config.model,
                 messages = messages,
                 max_tokens = config.max_tokens,
                 stream = false,
-                temperature = 0.7,
+                temperature = 0.4,
                 top_p = 0.95
             )
             
@@ -104,6 +97,21 @@ class HuggingFaceClient(private val config: AIConfig) {
     }
     
     /**
+     * Отправить вопрос к HuggingFace модели (простой вариант)
+     */
+    fun ask(prompt: String, systemPrompt: String? = null): String {
+        val messages = mutableListOf<HFMessage>()
+        
+        if (systemPrompt != null) {
+            messages.add(HFMessage(role = "system", content = systemPrompt))
+        }
+        
+        messages.add(HFMessage(role = "user", content = prompt))
+        
+        return ask(messages)
+    }
+    
+    /**
      * Проверка работоспособности API
      */
     fun healthCheck(): Boolean {
@@ -140,7 +148,7 @@ data class HFMessage(
 @Serializable
 data class HFResponse(
     val id: String? = null,
-    val object: String? = null,
+    @SerialName("object") val objectType: String? = null,
     val created: Long? = null,
     val model: String? = null,
     val choices: List<HFChoice>,

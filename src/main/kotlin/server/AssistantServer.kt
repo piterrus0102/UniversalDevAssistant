@@ -1,6 +1,8 @@
 package server
 
 import ai.HuggingFaceClient
+import ai.HFMessage
+import ai.SystemPrompts
 import config.ProjectConfig
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
@@ -10,22 +12,245 @@ import io.ktor.server.netty.*
 import io.ktor.server.plugins.contentnegotiation.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import io.ktor.server.request.*
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
-import mcp.GitMCP
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import mcp.MCPOrchestrator
 import mu.KotlinLogging
-import rag.RAGService
 
 private val logger = KotlinLogging.logger {}
 
 /**
  * HTTP сервер на Ktor для Dev Assistant
+ * 
+ * Использует MCP архитектуру с tool calling через LLM
  */
 class AssistantServer(
     private val config: ProjectConfig,
-    private val rag: RAGService,
-    private val git: GitMCP,
+    private val mcpOrchestrator: MCPOrchestrator,
     private val aiClient: HuggingFaceClient
 ) {
+    
+    private val json = Json { ignoreUnknownKeys = true }
+    
+    // Флаг ожидания INCORRECT_RAG_ANSWER (включается после search_knowledge_base)
+    @Volatile
+    private var expectingIncorrectRAG = false
+    
+    // Оригинальный запрос пользователя (для реранкинга)
+    @Volatile
+    private var lastUserQuery: String = ""
+    
+    /**
+     * Очистка ответа от артефактов (JSON tool calls, комментариев и т.д.)
+     */
+    private fun cleanResponse(response: String): String {
+        var cleaned = response.trim()
+        
+        // Убираем JSON tool calls если они попали в ответ
+        cleaned = cleaned.replace(Regex("""\{"tool":\s*"[^"]+",\s*"args":\s*\{[^}]*\}\}"""), "")
+        
+        // Убираем markdown json блоки
+        cleaned = cleaned.replace(Regex("""```json.*?```""", RegexOption.DOT_MATCHES_ALL), "")
+        
+        // Убираем комментарии в квадратных скобках типа [сервер вызывает tool...]
+        cleaned = cleaned.replace(Regex("""\[.*?\]"""), "")
+        
+        // Убираем префиксы типа "A:", "Assistant:", "Ответ:"
+        cleaned = cleaned.replace(Regex("""^(A:|Assistant:|Ответ:)\s*""", RegexOption.MULTILINE), "")
+        
+        // Убираем лишние пустые строки
+        cleaned = cleaned.replace(Regex("""\n{3,}"""), "\n\n")
+        
+        return cleaned.trim()
+    }
+    
+    /**
+     * Вызов LLM с поддержкой MCP tool calling
+     **
+     * Workflow:
+     * 1. Собираем tools от всех MCP серверов
+     * 2. Формируем system prompt с описанием tools
+     * 3. Отправляем в LLM
+     * 4. Парсим ответ на наличие USE_TOOL:
+     * 5. Если есть - вызываем tool, отправляем результат обратно в LLM
+     * 6. Повторяем пока не получим финальный ответ
+     */
+    private suspend fun callLLMWithTools(userMessage: String): String {
+        // Сохраняем оригинальный запрос пользователя для возможного реранкинга
+        lastUserQuery = userMessage
+        
+        logger.info { "🤖 Вызов LLM с MCP tools..." }
+        
+        // 1. Собираем tools от всех MCP серверов
+        val tools = mcpOrchestrator.getAllTools()
+        logger.debug { "📋 Доступно tools: ${tools.size}" }
+        tools.forEach { logger.debug { "  - ${it.name}" } }
+        
+        // 2. Формируем system prompt (с учетом ожидания жалоб)
+        val systemPrompt = SystemPrompts.createSystemMessage(config, tools, expectingIncorrectRAG)
+        
+        // 3. Формируем сообщения для LLM
+        val messages = mutableListOf(
+            HFMessage(role = "system", content = systemPrompt),
+            HFMessage(role = "user", content = userMessage)
+        )
+        
+        var currentResponse = aiClient.ask(messages)
+        
+        logger.info { "📥 Ответ LLM получен" }
+        val usedTools = mutableListOf<String>()
+        val allTools = tools.map { it.name }
+        
+        // Tool calling loop: пытаемся распарсить ответ как JSON
+        while (true) {
+            // ===== ПРОВЕРКА НА INCORRECT_RAG_ANSWER =====
+            if (expectingIncorrectRAG && currentResponse.trim() == "INCORRECT_RAG_ANSWER") {
+                logger.info { "🚨 INCORRECT_RAG_ANSWER ОБНАРУЖЕН!" }
+                logger.info { "Пользователь недоволен ответом, запускаю РЕРАНКИНГ..." }
+                
+                // Выключаем детекцию
+                expectingIncorrectRAG = false
+                
+                // Запускаем реранкинг через MCP tool
+                try {
+                    logger.info { "🔄 Вызов tool: rerank_search с оригинальным запросом" }
+                    
+                    // Используем сохраненный оригинальный запрос (до жалобы "не то")
+                    // Ищем второй с конца user message (предыдущий запрос перед жалобой)
+                    val originalQuery = messages.asReversed()
+                        .filter { it.role == "user" }
+                        .drop(1)  // Пропускаем текущий запрос (жалобу)
+                        .firstOrNull()?.content ?: lastUserQuery
+                    
+                    logger.info { "Оригинальный запрос для реранкинга: \"$originalQuery\"" }
+                    logger.info { "Текущий запрос (жалоба): \"$userMessage\"" }
+                    
+                    val rerankResult = mcpOrchestrator.callTool("rerank_search", mapOf("query" to originalQuery))
+                    val rerankText = rerankResult.content.firstOrNull()?.text ?: "Не удалось улучшить результаты"
+                    
+                    logger.info { "📦 Результат реранкинга получен (${rerankText.length} chars)" }
+                    
+                    // Используем формат как в createToolResultMessage
+                    val formattedResult = """Результат инструмента rerank_search (улучшенный поиск с LLM оценкой):
+$rerankText
+
+🎯 КРИТИЧЕСКИ ВАЖНО - ОТВЕТЬ ПОЛЬЗОВАТЕЛЮ:
+
+1. ✅ Используй БУКВАЛЬНО информацию из результата выше
+2. ✅ Если в результате есть список - ПЕРЕПИШИ ЕГО ПОЛНОСТЬЮ, не сокращай!
+3. ✅ НЕ придумывай, НЕ додумывай - ТОЛЬКО то что написано выше
+4. ✅ Верни ОБЫЧНЫЙ ТЕКСТОВЫЙ ответ на РУССКОМ языке (НЕ JSON!)
+5. ✅ В КОНЦЕ добавь "📚 Источники:" со списком файлов из результата
+
+❌ НЕ ПИШИ НА КИТАЙСКОМ! Только русский!
+❌ НЕ выдумывай информацию которой нет в результате!
+
+Если в результате есть полный список (например, endpoints) - СКОПИРУЙ ЕГО ВЕСЬ!"""
+                    
+                    messages.add(HFMessage(role = "assistant", content = currentResponse))
+                    messages.add(HFMessage(role = "user", content = formattedResult))
+                    
+                    logger.info { "📨 Отправляем улучшенные результаты в LLM..." }
+                    currentResponse = aiClient.ask(messages)
+                    logger.info { "✅ Реранкинг завершен, получен новый ответ (${currentResponse.length} chars)" }
+                    
+                    // НЕ делаем continue - выходим из цикла с новым ответом
+                    break
+                    
+                } catch (e: Exception) {
+                    logger.error(e) { "❌ Ошибка реранкинга" }
+                    return "Извините, произошла ошибка при попытке улучшить результаты поиска: ${e.message}"
+                }
+            }
+            
+            // Извлекаем JSON из markdown блока если есть
+            var jsonText = currentResponse.trim()
+            
+            // Если ответ в markdown блоке ```json ... ``` - извлекаем JSON
+            val markdownJsonRegex = Regex("""```json\s*(\{.*?\})\s*```""", RegexOption.DOT_MATCHES_ALL)
+            val markdownMatch = markdownJsonRegex.find(jsonText)
+            if (markdownMatch != null) {
+                jsonText = markdownMatch.groupValues[1].trim()
+                logger.debug { "📦 Извлечен JSON из markdown блока" }
+            }
+            
+            // Пытаемся распарсить как ToolCall
+            val toolCall = try {
+                json.decodeFromString<ToolCall>(jsonText)
+            } catch (e: Exception) {
+                // Не JSON или не ToolCall - значит это финальный ответ
+                logger.debug { "Ответ не является tool call, это финальный ответ" }
+                null
+            }
+            
+            // Если не tool call - выходим из цикла
+            if (toolCall == null) break
+            
+            logger.info { "🔧 Tool call: ${toolCall.tool}(${toolCall.args})" }
+            
+            // Проверяем что tool существует
+            if (!allTools.contains(toolCall.tool)) {
+                val errorMsg = SystemPrompts.createToolNotFoundMessage(toolCall.tool, allTools)
+                messages.add(HFMessage(role = "assistant", content = currentResponse))
+                messages.add(HFMessage(role = "user", content = errorMsg))
+                
+                currentResponse = aiClient.ask(messages)
+                continue
+            }
+            
+            // Вызываем tool
+            try {
+                logger.info { "⚙️ Вызов tool: ${toolCall.tool}" }
+                val argsAsAny: Map<String, Any> = toolCall.args.mapValues { it.value as Any }
+                val result = mcpOrchestrator.callTool(toolCall.tool, argsAsAny)
+                val resultText = result.content.firstOrNull()?.text ?: "No result"
+                
+                usedTools.add(toolCall.tool)
+                logger.info { "✅ Tool ${toolCall.tool} выполнен" }
+                logger.info { "📄 Результат tool (первые 300 символов): ${resultText.take(300)}..." }
+                
+                // Если это был search_knowledge_base - включаем детекцию жалоб
+                if (toolCall.tool == "search_knowledge_base") {
+                    expectingIncorrectRAG = true
+                    logger.info { "🔔 Детекция INCORRECT_RAG_ANSWER ВКЛЮЧЕНА (после search_knowledge_base)" }
+                }
+                
+                // Отправляем результат обратно в LLM
+                val formattedResult = SystemPrompts.createToolResultMessage(toolCall.tool, resultText)
+                logger.info { "📨 Отправляем результат в LLM (${formattedResult.length} chars)" }
+                
+                messages.add(HFMessage(role = "assistant", content = currentResponse))
+                messages.add(HFMessage(role = "user", content = formattedResult))
+                
+                logger.info { "🔄 Повторный запрос к LLM с результатом tool..." }
+                currentResponse = aiClient.ask(messages)
+                logger.info { "📥 Ответ LLM после tool: ${currentResponse.take(200)}..." }
+                
+            } catch (e: Exception) {
+                logger.error(e) { "❌ Ошибка вызова tool ${toolCall.tool}" }
+                val errorMsg = "ERROR при вызове ${toolCall.tool}: ${e.message}"
+                messages.add(HFMessage(role = "assistant", content = currentResponse))
+                messages.add(HFMessage(role = "user", content = errorMsg))
+                
+                currentResponse = aiClient.ask(messages)
+            }
+        }
+        
+        if (usedTools.isNotEmpty()) {
+            logger.info { "✅ Использовано tools: ${usedTools.joinToString(" → ")}" }
+        }
+        
+        // Очищаем ответ от артефактов
+        val cleanedResponse = cleanResponse(currentResponse)
+        logger.debug { "🧹 Ответ после очистки (${cleanedResponse.length} chars)" }
+        
+        return cleanedResponse
+    }
     
     fun start() {
         logger.info { "🌐 Запуск HTTP сервера..." }
@@ -46,13 +271,15 @@ class AssistantServer(
                         Путь: ${config.project.path}
                         
                         Доступные endpoints:
-                        - GET  /health          - Проверка работоспособности
-                        - GET  /help?q=вопрос   - Задать вопрос о проекте
-                        - GET  /git/status      - Git статус
-                        - GET  /git/branch      - Текущая ветка
-                        - GET  /git/info        - Полная информация о git
-                        - GET  /docs            - Список проиндексированных документов
-                        - GET  /docs/:path      - Содержимое конкретного документа
+                        - GET  /health          - Проверка работоспособности (MCP серверов)
+                        - GET  /help?q=вопрос   - Задать вопрос о проекте (MCP + AI Agent)
+                        - POST /reindex         - Переиндексация документации
+                        
+                        MCP Architecture:
+                        - LocalMCP: search_knowledge_base (RAG поиск по документации)
+                        - GitMCP: get_git_status, get_git_branch, get_git_commits, get_git_diff
+                        
+                        AI Agent автоматически выбирает нужные инструменты!
                         """.trimIndent(),
                         ContentType.Text.Plain
                     )
@@ -60,17 +287,61 @@ class AssistantServer(
                 
                 // Health check
                 get("/health") {
+                    val mcpServerCount = mcpOrchestrator.getServerCount()
+                    val mcpServers = mcpOrchestrator.getServerNames()
+                    
                     call.respond(
                         HealthResponse(
                             status = "ok",
                             project = config.project.name,
-                            docsCount = rag.getAllDocuments().size,
+                            mcpServers = mcpServerCount,
+                            mcpServerNames = mcpServers,
                             gitEnabled = config.git.enabled
                         )
                     )
                 }
                 
-                // /help?q=вопрос - главная фишка!
+                // Переиндексация документации
+                post("/reindex") {
+                    try {
+                        logger.info { "🔄 Запущена переиндексация документации..." }
+                        
+                        val startTime = System.currentTimeMillis()
+                        
+                        // Вызываем через MCP tool
+                        val result = runBlocking {
+                            try {
+                                mcpOrchestrator.callTool("reindex_documents", emptyMap())
+                                "success"
+                            } catch (e: Exception) {
+                                // Если tool не существует - значит нужна прямая реиндексация
+                                // (это нормально, т.к. reindex не обязательный tool)
+                                logger.warn { "Tool reindex_documents не найден, пропускаем" }
+                                "skipped"
+                            }
+                        }
+                        
+                        val duration = System.currentTimeMillis() - startTime
+                        
+                        logger.info { "✅ Переиндексация завершена за ${duration}ms" }
+                        
+                        call.respond(
+                            ReindexResponse(
+                                status = result,
+                                message = "Документация переиндексирована (кеш обновлен)",
+                                durationMs = duration
+                            )
+                        )
+                    } catch (e: Exception) {
+                        logger.error(e) { "❌ Ошибка переиндексации" }
+                        call.respond(
+                            HttpStatusCode.InternalServerError,
+                            ErrorResponse("Ошибка переиндексации: ${e.message}")
+                        )
+                    }
+                }
+                
+                // /help?q=вопрос - главная фишка! (MCP + Tool Calling)
                 get("/help") {
                     val question = call.request.queryParameters["q"]
                     
@@ -85,58 +356,16 @@ class AssistantServer(
                     logger.info { "❓ Вопрос: $question" }
                     
                     try {
-                        // 1. Поиск в документации через RAG
-                        val docsContext = rag.buildContext(question, maxDocs = 3)
+                        // Новая MCP архитектура:
+                        // 1. LLM получает вопрос + список tools
+                        // 2. LLM решает какие tools вызвать (USE_TOOL:)
+                        // 3. Вызываем tools через orchestrator
+                        // 4. Результаты обратно в LLM
+                        // 5. Финальный ответ
                         
-                        // 2. Информация о Git
-                        val gitInfo = if (config.git.enabled) {
-                            try {
-                                val info = git.getFullInfo()
-                                """
-                                |Git Status:
-                                |  Branch: ${info.currentBranch}
-                                |  Last Commit: ${info.lastCommit}
-                                |  Modified Files: ${info.modifiedFiles.size}
-                                |  ${if (info.modifiedFiles.isNotEmpty()) 
-                                      "Files: " + info.modifiedFiles.joinToString(", ") 
-                                      else "No changes"}
-                                """.trimMargin()
-                            } catch (e: Exception) {
-                                "Git info unavailable: ${e.message}"
-                            }
-                        } else {
-                            "Git integration disabled"
+                        val answer = runBlocking {
+                            callLLMWithTools(question)
                         }
-                        
-                        // 3. Формируем промпт для Claude
-                        val systemPrompt = """
-                            Ты - ассистент разработчика для проекта "${config.project.name}".
-                            
-                            Твоя задача - помогать разработчикам понимать структуру проекта, 
-                            отвечать на вопросы о коде, API, архитектуре.
-                            
-                            Отвечай кратко, по делу, с конкретными примерами из документации.
-                            Если в документации нет информации - так и скажи.
-                        """.trimIndent()
-                        
-                        val userPrompt = """
-                            $gitInfo
-                            
-                            ================================================================================
-                            ДОКУМЕНТАЦИЯ ПРОЕКТА:
-                            ================================================================================
-                            $docsContext
-                            
-                            ================================================================================
-                            ВОПРОС РАЗРАБОТЧИКА:
-                            ================================================================================
-                            $question
-                            
-                            Ответь на вопрос, используя информацию из документации выше.
-                        """.trimIndent()
-                        
-                        // 4. Спрашиваем AI (HuggingFace)
-                        val answer = aiClient.ask(userPrompt, systemPrompt)
                         
                         logger.info { "✅ Ответ сформирован (${answer.length} chars)" }
                         
@@ -144,8 +373,7 @@ class AssistantServer(
                             HelpResponse(
                                 project = config.project.name,
                                 question = question,
-                                answer = answer,
-                                sources = rag.search(question, limit = 3).map { it.path }
+                                answer = answer
                             )
                         )
                         
@@ -158,71 +386,112 @@ class AssistantServer(
                     }
                 }
                 
-                // Git endpoints
-                get("/git/status") {
-                    try {
-                        val status = git.getStatus()
-                        val branch = git.getCurrentBranch()
-                        call.respond(mapOf(
-                            "branch" to branch,
-                            "status" to status
-                        ))
-                    } catch (e: Exception) {
-                        call.respond(
-                            HttpStatusCode.InternalServerError,
-                            ErrorResponse(e.message ?: "Git error")
-                        )
-                    }
-                }
-                
-                get("/git/branch") {
-                    try {
-                        val branch = git.getCurrentBranch()
-                        call.respond(mapOf("branch" to branch))
-                    } catch (e: Exception) {
-                        call.respond(
-                            HttpStatusCode.InternalServerError,
-                            ErrorResponse(e.message ?: "Git error")
-                        )
-                    }
-                }
-                
+                // Git информация
                 get("/git/info") {
                     try {
-                        val info = git.getFullInfo()
-                        call.respond(info)
+                        if (!config.git.enabled) {
+                            call.respond(
+                                ErrorResponse("Git интеграция отключена")
+                            )
+                            return@get
+                        }
+                        
+                        val status = runBlocking {
+                            mcpOrchestrator.callTool("get_git_status", emptyMap())
+                        }
+                        val statusText = status.content.firstOrNull()?.text ?: ""
+                        
+                        // Парсинг git status (формат: "Git Status:\n  Branch: main\n  Last Commit: ...")
+                        val branchRegex = Regex("""Branch:\s*(.+)""")
+                        val commitRegex = Regex("""Last Commit:\s*(.+)""")
+                        
+                        val branch = branchRegex.find(statusText)?.groupValues?.get(1)?.trim() ?: "unknown"
+                        val lastCommit = commitRegex.find(statusText)?.groupValues?.get(1)?.trim() ?: ""
+                        
+                        call.respond(
+                            GitInfoResponse(
+                                currentBranch = branch,
+                                status = statusText,
+                                lastCommit = lastCommit
+                            )
+                        )
                     } catch (e: Exception) {
+                        logger.error(e) { "Ошибка получения git info" }
                         call.respond(
                             HttpStatusCode.InternalServerError,
-                            ErrorResponse(e.message ?: "Git error")
+                            ErrorResponse("Ошибка: ${e.message}")
                         )
                     }
                 }
                 
-                // Docs endpoints
-                get("/docs") {
-                    val docs = rag.getAllDocuments()
-                    call.respond(
-                        DocsListResponse(
-                            count = docs.size,
-                            documents = docs.map { 
-                                DocInfo(it.path, it.lines, it.size) 
-                            }
+                // Текущая ветка
+                get("/git/branch") {
+                    try {
+                        if (!config.git.enabled) {
+                            call.respond(
+                                ErrorResponse("Git интеграция отключена")
+                            )
+                            return@get
+                        }
+                        
+                        val result = runBlocking {
+                            mcpOrchestrator.callTool("get_git_branch", emptyMap())
+                        }
+                        val branchText = result.content.firstOrNull()?.text ?: "unknown"
+                        
+                        // Формат: "Текущая ветка: main" - извлекаем только название
+                        val branch = branchText.substringAfter("Текущая ветка:", "unknown").trim()
+                        
+                        call.respond(
+                            GitBranchResponse(branch = branch)
                         )
-                    )
+                    } catch (e: Exception) {
+                        logger.error(e) { "Ошибка получения ветки" }
+                        call.respond(
+                            HttpStatusCode.InternalServerError,
+                            ErrorResponse("Ошибка: ${e.message}")
+                        )
+                    }
                 }
                 
-                get("/docs/{path...}") {
-                    val path = call.parameters.getAll("path")?.joinToString("/") ?: ""
-                    val doc = rag.getDocument(path)
-                    
-                    if (doc == null) {
+                // Список документов (реально проиндексированных)
+                get("/docs") {
+                    try {
+                        // Читаем index.json чтобы показать РЕАЛЬНО проиндексированные файлы
+                        val indexFile = java.io.File("src/main/kotlin/rag/index.json")
+                        
+                        if (indexFile.exists()) {
+                            val indexJson = indexFile.readText()
+                            val index = json.parseToJsonElement(indexJson).jsonObject
+                            val documents = index["documents"]?.jsonArray ?: emptyList()
+                            
+                            val docs = documents.map { doc ->
+                                val path = doc.jsonObject["path"]?.jsonPrimitive?.content ?: "unknown"
+                                DocInfo(path = path)
+                            }
+                            
+                            call.respond(
+                                DocsResponse(
+                                    count = docs.size,
+                                    documents = docs
+                                )
+                            )
+                        } else {
+                            // Если индекс еще не создан - показываем что задано в конфиге
+                            val docs = config.project.docs.map { DocInfo(path = it) }
+                            call.respond(
+                                DocsResponse(
+                                    count = docs.size,
+                                    documents = docs
+                                )
+                            )
+                        }
+                    } catch (e: Exception) {
+                        logger.error(e) { "Ошибка получения списка документов" }
                         call.respond(
-                            HttpStatusCode.NotFound,
-                            ErrorResponse("Документ не найден: $path")
+                            HttpStatusCode.InternalServerError,
+                            ErrorResponse("Ошибка: ${e.message}")
                         )
-                    } else {
-                        call.respond(doc)
                     }
                 }
             }
@@ -233,6 +502,19 @@ class AssistantServer(
 }
 
 // ============================================================================
+// Internal Models
+// ============================================================================
+
+/**
+ * Tool call от LLM (чистый JSON когда нужен инструмент)
+ */
+@Serializable
+data class ToolCall(
+    val tool: String,
+    val args: Map<String, String> = emptyMap()
+)
+
+// ============================================================================
 // Response Models
 // ============================================================================
 
@@ -240,7 +522,8 @@ class AssistantServer(
 data class HealthResponse(
     val status: String,
     val project: String,
-    val docsCount: Int,
+    val mcpServers: Int,
+    val mcpServerNames: List<String>,
     val gitEnabled: Boolean
 )
 
@@ -248,8 +531,7 @@ data class HealthResponse(
 data class HelpResponse(
     val project: String,
     val question: String,
-    val answer: String,
-    val sources: List<String>
+    val answer: String
 )
 
 @Serializable
@@ -258,15 +540,32 @@ data class ErrorResponse(
 )
 
 @Serializable
-data class DocsListResponse(
+data class ReindexResponse(
+    val status: String,
+    val message: String,
+    val durationMs: Long
+)
+
+@Serializable
+data class GitInfoResponse(
+    val currentBranch: String,
+    val status: String,
+    val lastCommit: String
+)
+
+@Serializable
+data class GitBranchResponse(
+    val branch: String
+)
+
+@Serializable
+data class DocsResponse(
     val count: Int,
     val documents: List<DocInfo>
 )
 
 @Serializable
 data class DocInfo(
-    val path: String,
-    val lines: Int,
-    val size: Long
+    val path: String
 )
 

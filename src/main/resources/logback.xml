@@ -9,6 +9,9 @@
         <appender-ref ref="STDOUT" />
     </root>
     
+    <!-- Debug логи для RAG -->
+    <logger name="rag.RAGService" level="DEBUG"/>
+    
     <!-- Уменьшаем логи Ktor -->
     <logger name="io.ktor" level="WARN"/>
     <logger name="io.netty" level="WARN"/>

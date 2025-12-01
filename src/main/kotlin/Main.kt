@@ -1,9 +1,12 @@
 import ai.HuggingFaceClient
 import config.ProjectConfig
 import mcp.GitMCP
+import mcp.LocalMCP
+import mcp.MCPOrchestrator
 import mu.KotlinLogging
 import rag.OllamaClient
 import rag.RAGService
+import rag.Reranker
 import server.AssistantServer
 import kotlin.system.exitProcess
 
@@ -15,7 +18,8 @@ private val logger = KotlinLogging.logger {}
  * Универсальный AI-ассистент для любого проекта с поддержкой:
  * - RAG (Retrieval-Augmented Generation) для документации
  * - MCP (Model Context Protocol) для Git
- * - Claude API для интеллектуальных ответов
+ * - HuggingFace AI (Qwen 2.5) для интеллектуальных ответов
+ * - Ollama для векторизации документов
  */
 fun main() {
     printBanner()
@@ -49,10 +53,36 @@ fun main() {
             null
         }
         
-        val rag = RAGService(config, ollamaClient)
-        val git = GitMCP(config.project.path)
         val hfClient = HuggingFaceClient(config.ai)
         
+        // Reranker для улучшения релевантности (опционально, использует HF client)
+        val reranker = if (config.vectorization?.enabled == true) {
+            Reranker(hfClient)
+        } else {
+            null
+        }
+        
+        val rag = RAGService(config, ollamaClient, reranker)
+        
+        // MCP Orchestrator - координатор всех MCP серверов
+        logger.info { "🔧 Инициализация MCP архитектуры..." }
+        val mcpOrchestrator = MCPOrchestrator()
+        
+        // Регистрируем LocalMCP (search_knowledge_base)
+        val localMCP = LocalMCP(config, rag)
+        mcpOrchestrator.registerServer("local", localMCP)
+        logger.info { "  ✓ LocalMCP зарегистрирован (RAG поиск)" }
+        
+        // Регистрируем GitMCP (git tools)
+        val git = GitMCP(config.project.path)
+        if (config.git.enabled) {
+            mcpOrchestrator.registerServer("git", git)
+            logger.info { "  ✓ GitMCP зарегистрирован (Git инструменты)" }
+        } else {
+            logger.info { "  ⏭️ GitMCP отключен в конфиге" }
+        }
+        
+        logger.info { "✅ MCP серверов зарегистрировано: ${mcpOrchestrator.getServerCount()}" }
         logger.info { "✅ Компоненты инициализированы" }
         
         // 3. Проверяем Git
@@ -68,9 +98,12 @@ fun main() {
             logger.info { "⏭️  Git интеграция отключена в конфиге" }
         }
         
-        // 4. Индексируем документацию
-        logger.info { "📚 Индексация документации..." }
-        rag.indexDocuments()
+        // 4. Загружаем или индексируем документацию
+        logger.info { "📚 Загрузка индекса документации..." }
+        if (rag.loadIndexIfExists().not()) {
+            logger.info { "🔄 Индекс не найден или устарел, выполняю индексацию..." }
+            rag.indexDocuments()
+        }
         
         // 5. Проверяем HuggingFace API
         logger.info { "🧪 Проверка HuggingFace API..." }
@@ -99,8 +132,7 @@ fun main() {
         
         val server = AssistantServer(
             config = config,
-            rag = rag,
-            git = git,
+            mcpOrchestrator = mcpOrchestrator,
             aiClient = hfClient
         )
         
@@ -128,10 +160,10 @@ private fun printBanner() {
         
         ╔══════════════════════════════════════════════════════════════════╗
         ║                                                                  ║
-        ║        🤖 Universal Dev Assistant                               ║
+        ║        Universal Dev Assistant                                   ║
         ║                                                                  ║
-        ║        AI-powered assistant for your development project        ║
-        ║        with RAG, MCP, and Claude API                            ║
+        ║        AI-powered assistant for your development project         ║
+        ║        with RAG, MCP, and HuggingFace AI (Qwen 2.5)              ║
         ║                                                                  ║
         ╚══════════════════════════════════════════════════════════════════╝
         
