@@ -27,21 +27,30 @@ class MCPOrchestrator {
      * Получить все tools от всех MCP серверов
      */
     suspend fun getAllTools(): List<MCPTool> {
-        logger.debug { "🔧 Сбор tools от ${mcpServers.size} MCP серверов..." }
+        logger.info { "🔧 Сбор tools от ${mcpServers.size} MCP серверов..." }
         
         val allTools = mutableListOf<MCPTool>()
         
         for ((name, server) in mcpServers) {
             try {
                 val response = server.listTools()
-                logger.debug { "  ✓ $name: ${response.tools.size} tools" }
+                logger.info { "  ✓ $name: ${response.tools.size} tools" }
+                response.tools.forEach { tool ->
+                    logger.info { "      📌 ${tool.name}" }
+                }
                 allTools.addAll(response.tools)
             } catch (e: Exception) {
                 logger.error(e) { "  ✗ Ошибка получения tools от $name" }
             }
         }
         
-        logger.debug { "✅ Всего tools: ${allTools.size}" }
+        logger.info { "=" .repeat(60) }
+        logger.info { "📋 ПОЛНЫЙ СПИСОК TOOLS ДЛЯ LLM (${allTools.size}):" }
+        allTools.forEach { tool ->
+            logger.info { "  • ${tool.name}: ${tool.description.take(50)}..." }
+        }
+        logger.info { "=" .repeat(60) }
+        
         return allTools
     }
     
@@ -76,8 +85,17 @@ class MCPOrchestrator {
         val server = findServerForTool(toolName)
             ?: throw IllegalArgumentException("Tool '$toolName' не найден ни в одном MCP сервере")
         
-        logger.info { "⚙️ Вызов tool: $toolName" }
-        return server.callTool(toolName, args)
+        logger.info { "=" .repeat(60) }
+        logger.info { "🔧 ВЫЗОВ ИНСТРУМЕНТА: $toolName" }
+        logger.info { "📦 Аргументы от LLM (могут быть неточные): $args" }
+        logger.info { "⚠️ owner/repo будут заменены из конфига в GitHubMCP" }
+        logger.info { "=" .repeat(60) }
+        
+        val result = server.callTool(toolName, args)
+        
+        logger.info { "✅ Инструмент $toolName выполнен (результат: ${result.content.firstOrNull()?.text?.length ?: 0} символов)" }
+        
+        return result
     }
     
     /**

@@ -65,7 +65,7 @@ class RAGService(
             
             // Проверяем что индекс для нужного проекта
             if (index.projectPath != config.project.path) {
-                logger.warn { "⚠️ Индекс для другого проекта (${index.projectPath}), переиндексация..." }
+                logger.warn { "⚠️ Индекс для другого проекта (${index.projectPath})" }
                 return false
             }
             
@@ -156,7 +156,7 @@ class RAGService(
         // Уменьшили размер чанка с 2000 до 1000 для лучшей гранулярности
         chunks.clear()
         documents.forEach { doc ->
-            val docChunks = doc.toChunks(chunkSize = 1000, overlap = 300)
+            val docChunks = doc.toChunks(maxChunkSize = 1500)
             chunks.addAll(docChunks)
             if (docChunks.size > 1) {
                 logger.debug { "  📄 ${doc.path}: разбит на ${docChunks.size} чанков" }
@@ -237,7 +237,7 @@ class RAGService(
             // Берем топ чанков
             val topChunks = chunkSimilarities
                 .sortedByDescending { it.second }
-                .take(limit * 2)  // Берем больше чанков, т.к. может быть несколько из одного документа
+                .take(limit)  // Берем больше чанков, т.к. может быть несколько из одного документа
             
             logger.debug { "  Топ чанков:" }
             topChunks.take(5).forEach { (chunk, sim, idx) ->
@@ -326,22 +326,9 @@ class RAGService(
             
             // Показываем лучший результат даже если оценка низкая (> 0)
             val bestChunk = rerankResult.chunks.first()
-            val qualityNote = when {
-                bestChunk.llmScore >= 7 -> "высокая релевантность"
-                bestChunk.llmScore >= 5 -> "средняя релевантность"
-                else -> "низкая релевантность, но лучший доступный результат"
-            }
+            logger.info { "🎯 Лучший чанк: ${bestChunk.llmScore}/10" }
             
-            logger.info { "🎯 Лучший чанк: ${bestChunk.llmScore}/10 ($qualityNote)" }
-            
-            // Формируем контекст с указанием качества результатов
-            val header = if (bestChunk.llmScore < 5.0) {
-                "⚠️ ВНИМАНИЕ: LLM оценка ${bestChunk.llmScore.toInt()}/10 - результат может быть не очень релевантен, но это лучшее что найдено.\n\n"
-            } else {
-                ""
-            }
-            
-            val context = header + rerankResult.chunks.joinToString("\n\n" + "=".repeat(80) + "\n\n") { rankedChunk ->
+            val context = rerankResult.chunks.joinToString("\n\n" + "=".repeat(80) + "\n\n") { rankedChunk ->
                 """
                 |📄 Файл: ${rankedChunk.chunk.path} (чанк ${rankedChunk.chunk.chunkIndex})
                 |   🎯 LLM оценка: ${rankedChunk.llmScore.toInt()}/10, Similarity: ${(rankedChunk.similarity * 100).toInt()}%
@@ -368,41 +355,70 @@ class RAGService(
     /**
      * Формирует контекст для AI из найденных документов/чанков
      */
-    fun buildContext(query: String, maxDocs: Int = 2): ContextResult {  // Уменьшили с 3 до 2
-        // Если векторизация включена - используем чанки
+    fun buildContext(query: String, maxDocs: Int = 3): ContextResult {
+        // Если векторизация включена - используем чанки с vector search
         if (vectorizationEnabled && documentEmbeddings.isNotEmpty() && ollamaClient != null) {
             return buildContextFromChunks(query, maxChunks = maxDocs * 2)
         }
         
-        // Fallback: целые документы
-        val relevantDocs = search(query, maxDocs)
+        // Fallback: keyword search по чанкам (не по целым документам)
+        return buildContextFromChunksKeyword(query, maxChunks = maxDocs * 2)
+    }
+    
+    /**
+     * Keyword search по чанкам (fallback когда нет векторизации)
+     */
+    private fun buildContextFromChunksKeyword(query: String, maxChunks: Int = 4): ContextResult {
+        val queryTerms = query.lowercase()
+            .split(Regex("[\\s,.?!]+"))
+            .filter { it.length > 2 }
         
-        if (relevantDocs.isEmpty()) {
+        if (queryTerms.isEmpty() || chunks.isEmpty()) {
             return ContextResult(
                 context = "Документация не найдена по запросу.",
                 sources = emptyList()
             )
         }
         
-        val context = relevantDocs.joinToString("\n\n" + "=".repeat(80) + "\n\n") { doc ->
-            val snippet = doc.getRelevantSnippet(query, contextLines = 5)
+        // Скоринг чанков по количеству совпадающих термов
+        val scoredChunks = chunks.map { chunk ->
+            val score = queryTerms.sumOf { term ->
+                chunk.content.lowercase().split(Regex("\\W+"))
+                    .count { it == term }
+            }
+            Pair(chunk, score)
+        }
+            .filter { it.second > 0 }
+            .sortedByDescending { it.second }
+            .take(maxChunks)
+        
+        if (scoredChunks.isEmpty()) {
+            return ContextResult(
+                context = "Документация не найдена по запросу.",
+                sources = emptyList()
+            )
+        }
+        
+        logger.debug { "  Найдено ${scoredChunks.size} релевантных чанков (keyword search)" }
+        
+        val context = scoredChunks.joinToString("\n\n" + "=".repeat(80) + "\n\n") { (chunk, score) ->
             """
-            |📄 Файл: ${doc.path}
+            |📄 Файл: ${chunk.path} (чанк ${chunk.chunkIndex}, совпадений: $score)
             |
-            |${if (snippet.isNotEmpty()) snippet else doc.content.take(1000)}
+            |${chunk.content}
             """.trimMargin()
         }
         
         return ContextResult(
             context = context,
-            sources = relevantDocs.map { it.path }
+            sources = scoredChunks.map { it.first.path }.distinct()
         )
     }
     
     /**
      * Формирует контекст из релевантных чанков
      */
-    private fun buildContextFromChunks(query: String, maxChunks: Int = 2): ContextResult {  // По умолчанию 2
+    private fun buildContextFromChunks(query: String, maxChunks: Int = 3): ContextResult {  // По умолчанию 2
         try {
             val queryEmbedding = ollamaClient!!.embed(query)
             
@@ -416,7 +432,7 @@ class RAGService(
                 Pair(chunk, similarity)
             }
                 .sortedByDescending { it.second }
-                .take(maxChunks.coerceAtMost(2))  // Максимум 2 чанка
+                .take(maxChunks)
             
             if (topChunks.isEmpty()) {
                 return ContextResult(

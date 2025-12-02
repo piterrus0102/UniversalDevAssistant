@@ -71,7 +71,16 @@ data class MCPToolResult(
  */
 @Serializable
 data class MCPContent(
-    val type: String = "text",
+    val type: MCPContentType = MCPContentType.text,
     val text: String
 )
+
+enum class MCPContentType {
+    text,
+    currentBranch,
+    lastCommit,
+    modifiedFilesSize,
+    modifiedFiles,
+    recentCommits,
+}
 

@@ -21,8 +21,8 @@ class LocalMCP(
         return MCPToolsResponse(
             tools = listOf(
                 MCPTool(
-                    name = "read_project_file",
-                    description = "🔴 ПРИОРИТЕТ! Читает ИСХОДНЫЙ КОД файла проекта. " +
+                    name = READ_PROJECT_FILE_TOOL_NAME,
+                    description = "Читает ИСХОДНЫЙ КОД файла проекта. " +
                                   "ИСПОЛЬЗУЙ ЭТОТ ИНСТРУМЕНТ если пользователь упоминает КОНКРЕТНЫЙ ФАЙЛ: " +
                                   "router.php, App.jsx, main.py, controller.php, index.js и т.д. " +
                                   "Возвращает полное содержимое файла для анализа.",
@@ -38,10 +38,18 @@ class LocalMCP(
                     )
                 ),
                 MCPTool(
-                    name = "search_knowledge_base",
-                    description = "Ищет в ДОКУМЕНТАЦИИ проекта (.md файлы: README, гайды, описания). " +
-                                  "НЕ ИСПОЛЬЗУЙ для поиска исходного кода - для этого есть read_project_file! " +
-                                  "Используй только для концептуальных вопросов об архитектуре, гайдах.",
+                    name = SEARCH_KNOWLEDGE_BASE_TOOL_NAME,
+                    description = "Этот инструмент предназначен для поиска концептуальной информации в документации проекта. \n" +
+                            "Используйте его для вопросов об архитектуре, настройке, гайдах по использованию и общей информации о проекте.\n" +
+                            "\n" +
+                            "Что ищет: README.md, документацию (.md файлы), руководства, описание API, архитектурные решения\n" +
+                            "Что НЕ ищет: исходный код, конфигурационные файлы, логи - для этого используйте read_project_file\n" +
+                            "\n" +
+                            "Идеально подходит для:\n" +
+                            "• Понимания общей архитектуры проекта\n" +
+                            "• Поиска инструкций по настройке и развертыванию\n" +
+                            "• Ответов на вопросы \"как это работает\" на концептуальном уровне\n" +
+                            "• Изучения гайдов и руководств",
                     inputSchema = MCPToolSchema(
                         type = "object",
                         properties = mapOf(
@@ -54,7 +62,7 @@ class LocalMCP(
                     )
                 ),
                 MCPTool(
-                    name = "reindex_documents",
+                    name = REINDEX_DOCUMENTS_TOOL_NAME,
                     description = "Переиндексация документации проекта. Заново сканирует все документы согласно config.yaml и обновляет индекс.",
                     inputSchema = MCPToolSchema(
                         type = "object",
@@ -63,7 +71,7 @@ class LocalMCP(
                     )
                 ),
                 MCPTool(
-                    name = "rerank_search",
+                    name = RERANK_SEARCH_TOOL_NAME,
                     description = "Улучшенный поиск с реранкингом для повышения релевантности. Используется когда пользователь недоволен предыдущим ответом.",
                     inputSchema = MCPToolSchema(
                         type = "object",
@@ -84,7 +92,7 @@ class LocalMCP(
         logger.info { "🔧 LocalMCP вызов инструмента: $name" }
         
         return when (name) {
-            "search_knowledge_base" -> {
+            SEARCH_KNOWLEDGE_BASE_TOOL_NAME -> {
                 val query = args["query"] as? String
                     ?: throw IllegalArgumentException("Параметр 'query' обязателен")
                 
@@ -92,6 +100,16 @@ class LocalMCP(
                 
                 // Выполняем RAG поиск (берём 2 лучших чанка, не 3)
                 val result = ragService.buildContext(query, maxDocs = 2)
+                
+                // Логируем найденные документы
+                logger.info { "=" .repeat(60) }
+                logger.info { "📚 RAG РЕЗУЛЬТАТЫ для запроса: \"$query\"" }
+                logger.info { "📄 Найдено источников: ${result.sources.size}" }
+                result.sources.forEachIndexed { index, source ->
+                    logger.info { "  ${index + 1}. $source" }
+                }
+                logger.info { "📝 Размер контекста: ${result.context.length} символов" }
+                logger.info { "=" .repeat(60) }
                 
                 // Добавляем информацию об источниках
                 val sources = result.sources.joinToString("\n") { "- $it" }
@@ -105,14 +123,14 @@ class LocalMCP(
                 MCPToolResult(
                     content = listOf(
                         MCPContent(
-                            type = "text",
+                            type = MCPContentType.text,
                             text = contextWithSources
                         )
                     )
                 )
             }
-            
-            "reindex_documents" -> {
+
+            REINDEX_DOCUMENTS_TOOL_NAME -> {
                 logger.info { "🔄 Переиндексация документации..." }
                 
                 try {
@@ -121,7 +139,7 @@ class LocalMCP(
                     MCPToolResult(
                         content = listOf(
                             MCPContent(
-                                type = "text",
+                                type = MCPContentType.text,
                                 text = "✅ Документация успешно переиндексирована"
                             )
                         )
@@ -131,15 +149,15 @@ class LocalMCP(
                     MCPToolResult(
                         content = listOf(
                             MCPContent(
-                                type = "text",
+                                type = MCPContentType.text,
                                 text = "❌ Ошибка переиндексации: ${e.message}"
                             )
                         )
                     )
                 }
             }
-            
-            "rerank_search" -> {
+
+            RERANK_SEARCH_TOOL_NAME -> {
                 val query = args["query"] as? String
                     ?: throw IllegalArgumentException("Параметр 'query' обязателен")
                 
@@ -150,6 +168,16 @@ class LocalMCP(
                     ragService.rerankSearch(query, topK = 1)
                 }
                 
+                // Логируем найденные документы
+                logger.info { "=" .repeat(60) }
+                logger.info { "🔄 RERANK РЕЗУЛЬТАТЫ для запроса: \"$query\"" }
+                logger.info { "📄 Найдено источников: ${result.sources.size}" }
+                result.sources.forEachIndexed { index, source ->
+                    logger.info { "  ${index + 1}. $source" }
+                }
+                logger.info { "📝 Размер контекста: ${result.context.length} символов" }
+                logger.info { "=" .repeat(60) }
+                
                 // Добавляем информацию об источниках
                 val sources = result.sources.joinToString("\n") { "- $it" }
                 val contextWithSources = """
@@ -162,14 +190,14 @@ class LocalMCP(
                 MCPToolResult(
                     content = listOf(
                         MCPContent(
-                            type = "text",
+                            type = MCPContentType.text,
                             text = contextWithSources
                         )
                     )
                 )
             }
-            
-            "read_project_file" -> {
+
+            READ_PROJECT_FILE_TOOL_NAME -> {
                 val filename = args["filename"] as? String
                     ?: throw IllegalArgumentException("Параметр 'filename' обязателен")
                 
@@ -195,7 +223,7 @@ class LocalMCP(
                         MCPToolResult(
                             content = listOf(
                                 MCPContent(
-                                    type = "text",
+                                    type = MCPContentType.text,
                                     text = "⚠️ Файл '$filename' не найден, но есть похожий:\n\n" +
                                            "📄 Файл: $relativePath\n" +
                                            "📏 Строк: $lines\n" +
@@ -213,7 +241,7 @@ class LocalMCP(
                         MCPToolResult(
                             content = listOf(
                                 MCPContent(
-                                    type = "text",
+                                    type = MCPContentType.text,
                                     text = "❌ Файл '$filename' не найден в проекте.\n" +
                                            "Попробуй:\n" +
                                            "- Проверить имя файла\n" +
@@ -231,7 +259,7 @@ class LocalMCP(
                     MCPToolResult(
                         content = listOf(
                             MCPContent(
-                                type = "text",
+                                type = MCPContentType.text,
                                 text = "📄 Файл: $relativePath\n" +
                                        "📏 Строк: $lines\n" +
                                        "\n" +
@@ -418,6 +446,13 @@ class LocalMCP(
         return config.project.ignore.any { ignore ->
             pathStr.contains("/$ignore/") || pathStr.endsWith("/$ignore")
         }
+    }
+
+    companion object {
+        const val SEARCH_KNOWLEDGE_BASE_TOOL_NAME = "search_knowledge_base"
+        const val REINDEX_DOCUMENTS_TOOL_NAME = "reindex_documents"
+        const val RERANK_SEARCH_TOOL_NAME = "rerank_search"
+        const val READ_PROJECT_FILE_TOOL_NAME = "read_project_file"
     }
 }
 

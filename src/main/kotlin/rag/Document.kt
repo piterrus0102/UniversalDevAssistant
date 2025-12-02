@@ -26,51 +26,56 @@ data class Document(
     }
     
     /**
-     * Извлечение релевантного фрагмента с контекстом
+     * Разбить документ на чанки по параграфам (семантическое разбиение)
+     * Не режет слова и предложения посередине
      */
-    fun getRelevantSnippet(query: String, contextLines: Int = 3): String {
-        val lines = content.lines()
-        val matchingLines = mutableListOf<Int>()
+    fun toChunks(maxChunkSize: Int = 1500): List<DocumentChunk> {
+        if (content.length <= maxChunkSize) {
+            return listOf(DocumentChunk(path, content.trim(), 0))
+        }
         
-        lines.forEachIndexed { index, line ->
-            if (line.contains(query, ignoreCase = true)) {
-                matchingLines.add(index)
+        // Разбиваем по параграфам (двойной перенос строки)
+        val paragraphs = content.split(Regex("\n\\s*\n"))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        
+        val chunks = mutableListOf<DocumentChunk>()
+        var currentChunk = StringBuilder()
+        var chunkIndex = 0
+        
+        for (paragraph in paragraphs) {
+            // Если параграф сам по себе больше лимита - разбить по предложениям
+            if (paragraph.length > maxChunkSize) {
+                // Сначала сохраняем текущий чанк если есть
+                if (currentChunk.isNotEmpty()) {
+                    chunks.add(DocumentChunk(path, currentChunk.toString().trim(), chunkIndex++))
+                    currentChunk = StringBuilder()
+                }
+                
+                // Разбиваем большой параграф по предложениям
+                val sentences = paragraph.split(Regex("(?<=[.!?])\\s+"))
+                for (sentence in sentences) {
+                    if (currentChunk.length + sentence.length > maxChunkSize && currentChunk.isNotEmpty()) {
+                        chunks.add(DocumentChunk(path, currentChunk.toString().trim(), chunkIndex++))
+                        currentChunk = StringBuilder()
+                    }
+                    if (currentChunk.isNotEmpty()) currentChunk.append(" ")
+                    currentChunk.append(sentence)
+                }
+            } else {
+                // Обычный параграф - добавляем к текущему чанку
+                if (currentChunk.length + paragraph.length + 2 > maxChunkSize && currentChunk.isNotEmpty()) {
+                    chunks.add(DocumentChunk(path, currentChunk.toString().trim(), chunkIndex++))
+                    currentChunk = StringBuilder()
+                }
+                if (currentChunk.isNotEmpty()) currentChunk.append("\n\n")
+                currentChunk.append(paragraph)
             }
         }
         
-        if (matchingLines.isEmpty()) return ""
-        
-        val snippets = matchingLines.map { lineIndex ->
-            val start = maxOf(0, lineIndex - contextLines)
-            val end = minOf(lines.size, lineIndex + contextLines + 1)
-            lines.subList(start, end).joinToString("\n")
-        }
-        
-        return snippets.joinToString("\n\n---\n\n")
-    }
-    
-    /**
-     * Разбить документ на чанки для векторизации
-     * Чанки с overlap чтобы не терять контекст на границах
-     */
-    fun toChunks(chunkSize: Int = 1000, overlap: Int = 300): List<DocumentChunk> {
-        if (content.length <= chunkSize) {
-            return listOf(DocumentChunk(path, content, 0))
-        }
-        
-        val chunks = mutableListOf<DocumentChunk>()
-        var start = 0
-        var chunkIndex = 0
-        
-        while (start < content.length) {
-            val end = minOf(start + chunkSize, content.length)
-            val chunkContent = content.substring(start, end)
-            
-            chunks.add(DocumentChunk(path, chunkContent, chunkIndex))
-            
-            // Следующий чанк начинается с overlap
-            start += chunkSize - overlap
-            chunkIndex++
+        // Добавляем последний чанк
+        if (currentChunk.isNotEmpty()) {
+            chunks.add(DocumentChunk(path, currentChunk.toString().trim(), chunkIndex))
         }
         
         return chunks

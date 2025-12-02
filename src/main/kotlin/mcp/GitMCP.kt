@@ -20,7 +20,7 @@ class GitMCP(private val projectPath: String) : MCPServer {
         return MCPToolsResponse(
             tools = listOf(
                 MCPTool(
-                    name = "get_git_status",
+                    name = GET_GIT_STATUS_TOOL_NAME,
                     description = "Получить текущий статус Git репозитория (измененные файлы, текущая ветка)",
                     inputSchema = MCPToolSchema(
                         type = "object",
@@ -29,7 +29,7 @@ class GitMCP(private val projectPath: String) : MCPServer {
                     )
                 ),
                 MCPTool(
-                    name = "get_git_branch",
+                    name = GET_GIT_BRANCH_TOOL_NAME,
                     description = "Получить название текущей Git ветки",
                     inputSchema = MCPToolSchema(
                         type = "object",
@@ -38,7 +38,7 @@ class GitMCP(private val projectPath: String) : MCPServer {
                     )
                 ),
                 MCPTool(
-                    name = "get_git_commits",
+                    name = GET_GIT_COMMITS_TOOL_NAME,
                     description = "Получить список последних коммитов",
                     inputSchema = MCPToolSchema(
                         type = "object",
@@ -52,7 +52,7 @@ class GitMCP(private val projectPath: String) : MCPServer {
                     )
                 ),
                 MCPTool(
-                    name = "get_git_diff",
+                    name = GET_GIT_DIFF_TOOL_NAME,
                     description = "Получить diff (изменения) для конкретного файла",
                     inputSchema = MCPToolSchema(
                         type = "object",
@@ -73,46 +73,48 @@ class GitMCP(private val projectPath: String) : MCPServer {
         logger.info { "🔧 GitMCP вызов инструмента: $name" }
         
         return when (name) {
-            "get_git_status" -> {
+            GET_GIT_STATUS_TOOL_NAME -> {
                 val info = getFullInfo()
-                val statusText = buildString {
-                    appendLine("Git Status:")
-                    appendLine("  Branch: ${info.currentBranch}")
-                    appendLine("  Last Commit: ${info.lastCommit}")
-                    appendLine("  Modified Files: ${info.modifiedFiles.size}")
-                    if (info.modifiedFiles.isNotEmpty()) {
-                        appendLine("  Files:")
-                        info.modifiedFiles.forEach { file ->
-                            appendLine("    - $file")
-                        }
-                    } else {
-                        appendLine("  (no changes)")
-                    }
-                }
-                
                 MCPToolResult(
                     content = listOf(
                         MCPContent(
-                            type = "text",
-                            text = statusText
+                            type = MCPContentType.currentBranch,
+                            text = info.currentBranch
+                        ),
+                        MCPContent(
+                            type = MCPContentType.lastCommit,
+                            text = info.lastCommit
+                        ),
+                        MCPContent(
+                            type = MCPContentType.modifiedFilesSize,
+                            text = info.modifiedFiles.size.toString()
+                        ),
+                        MCPContent(
+                            type = MCPContentType.modifiedFiles,
+                            text = buildString {
+                                appendLine("  Files:")
+                                info.modifiedFiles.forEach { file ->
+                                    appendLine("    - $file")
+                                }
+                            }
                         )
                     )
                 )
             }
-            
-            "get_git_branch" -> {
+
+            GET_GIT_BRANCH_TOOL_NAME -> {
                 val branch = getCurrentBranch()
                 MCPToolResult(
                     content = listOf(
                         MCPContent(
-                            type = "text",
+                            type = MCPContentType.currentBranch,
                             text = "Текущая ветка: $branch"
                         )
                     )
                 )
             }
-            
-            "get_git_commits" -> {
+
+            GET_GIT_COMMITS_TOOL_NAME -> {
                 val limit = (args["limit"] as? Number)?.toInt() ?: 5
                 val commits = getRecentCommits(limit)
                 val commitsText = buildString {
@@ -125,14 +127,14 @@ class GitMCP(private val projectPath: String) : MCPServer {
                 MCPToolResult(
                     content = listOf(
                         MCPContent(
-                            type = "text",
+                            type = MCPContentType.recentCommits,
                             text = commitsText
                         )
                     )
                 )
             }
-            
-            "get_git_diff" -> {
+
+            GET_GIT_DIFF_TOOL_NAME -> {
                 val file = args["file"] as? String
                     ?: throw IllegalArgumentException("Параметр 'file' обязателен")
                 
@@ -140,7 +142,7 @@ class GitMCP(private val projectPath: String) : MCPServer {
                 MCPToolResult(
                     content = listOf(
                         MCPContent(
-                            type = "text",
+                            type = MCPContentType.text,
                             text = if (diff.isBlank()) {
                                 "Нет изменений в файле $file"
                             } else {
@@ -281,20 +283,15 @@ class GitMCP(private val projectPath: String) : MCPServer {
         
         return output
     }
+
+    companion object {
+        const val GET_GIT_STATUS_TOOL_NAME = "get_git_status"
+        const val GET_GIT_BRANCH_TOOL_NAME = "get_git_branch"
+        const val GET_GIT_COMMITS_TOOL_NAME = "get_git_commits"
+        const val GET_GIT_DIFF_TOOL_NAME = "get_git_diff"
+    }
 }
 
-/**
- * Модель данных с информацией о git репозитории
- */
-@Serializable
-data class GitInfo(
-    val isGitRepo: Boolean,
-    val currentBranch: String,
-    val lastCommit: String,
-    val modifiedFiles: List<String>,
-    val status: String,
-    val remote: String
-)
 
 
 

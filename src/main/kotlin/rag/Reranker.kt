@@ -80,36 +80,28 @@ class Reranker(private val llmClient: HuggingFaceClient?) {
                 role = "system",
                 content = """Ты - эксперт по оценке релевантности документов для проекта ${rankedChunk.chunk.path}.
 
-Твоя задача: оценить насколько чанк документа может помочь ответить на вопрос пользователя.
-
-ШКАЛА ОЦЕНКИ (0-10):
-- 9-10: ИДЕАЛЬНО - чанк полностью отвечает на вопрос, содержит именно то что нужно
-- 7-8: ХОРОШО - чанк содержит релевантную информацию, может помочь ответить
-- 5-6: ПОДХОДИТ - чанк частично релевантен, есть связанная информация
-- 3-4: СЛАБО - чанк касается темы, но косвенно
-- 0-2: НЕ РЕЛЕВАНТЕН - чанк не связан с вопросом
-
-ВАЖНО:
-- Оценивай ЛИБЕРАЛЬНО - если чанк хоть как-то связан с темой вопроса, ставь >= 5
-- Если в чанке есть ключевые слова из вопроса - это уже >= 5 баллов
-- Ставь низкие оценки (< 5) ТОЛЬКО если чанк вообще о другом
-
-ФОРМАТ ОТВЕТА:
-Верни ТОЛЬКО ОДНО ЧИСЛО от 0 до 10 (без точки, без текста)"""
+                            Твоя задача: оценить насколько чанк документа может помочь ответить на вопрос пользователя.
+                            
+                            ВАЖНО:
+                            - Оценивай ЛИБЕРАЛЬНО - если чанк хоть как-то связан с темой вопроса, ставь >= 0
+                            - Если в чанке есть ключевые слова из вопроса - это уже >= 5 баллов
+                            - Ставь низкие оценки (0) ТОЛЬКО если чанк вообще о другом
+                            
+                            ФОРМАТ ОТВЕТА:
+                            Верни ТОЛЬКО ОДНО ЧИСЛО от 0 до 10 (без точки, без текста)"""
             )
             
             val userMessage = HFMessage(
                 role = "user",
                 content = """ВОПРОС: $query
 
-ЧАНК ДОКУМЕНТА:
-Файл: ${rankedChunk.chunk.path}
-Чанк: ${rankedChunk.chunk.chunkIndex}
-
-Контент:
-${rankedChunk.chunk.content.take(1000)}${if (rankedChunk.chunk.content.length > 1000) "..." else ""}
-
-Оцени релевантность чанка вопросу (0-10):"""
+                ЧАНК ДОКУМЕНТА:
+                Файл: ${rankedChunk.chunk.path}
+                Чанк: ${rankedChunk.chunk.chunkIndex}
+                
+                Контент: ${rankedChunk.chunk.content}
+                
+                Оцени релевантность чанка вопросу (0-10):"""
             )
             
             try {
@@ -120,15 +112,12 @@ ${rankedChunk.chunk.content.take(1000)}${if (rankedChunk.chunk.content.length > 
                 val scoreText = response.trim()
                 val score = scoreText.toDoubleOrNull() ?: 0.0
                 
-                if (score < 0 || score > 10) {
+                if (score !in 0.0..10.0) {
                     scoredChunks.add(rankedChunk.copy(llmScore = 0.0))
                 } else {
                     scoredChunks.add(rankedChunk.copy(llmScore = score))
                     logger.debug { "[Reranker]   LLM оценка: ${score.toInt()}/10" }
                 }
-                
-                // Убрали delay - HuggingFace API справится без задержки
-                
             } catch (e: Exception) {
                 logger.error(e) { "[Reranker] ❌ Ошибка оценки через LLM" }
                 scoredChunks.add(rankedChunk.copy(llmScore = 0.0))
@@ -183,8 +172,7 @@ ${rankedChunk.chunk.content.take(1000)}${if (rankedChunk.chunk.content.length > 
         
         logger.info { "[Reranker] ✅ Финальных чанков: ${finalChunks.size}" }
         finalChunks.forEachIndexed { i, chunk ->
-            val quality = if (chunk.llmScore >= 7) "ОТЛИЧНО" else if (chunk.llmScore >= 5) "ХОРОШО" else "СЛАБО"
-            logger.info { "  ${i + 1}. [LLM: ${chunk.llmScore.toInt()}/10, Sim: ${(chunk.similarity * 100).toInt()}%] ${chunk.chunk.path} ($quality)" }
+            logger.info { "  ${i + 1}. [LLM: ${chunk.llmScore.toInt()}/10, Sim: ${(chunk.similarity * 100).toInt()}%] ${chunk.chunk.path}" }
         }
         
         logger.info { "[Reranker] ====================================" }

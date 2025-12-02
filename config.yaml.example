@@ -37,7 +37,16 @@ server:
   port: 3002
   host: "0.0.0.0"
 
-# Настройки Git MCP
+# Настройки Git MCP (локальный репозиторий)
 git:
   enabled: true
+
+# Настройки GitHub MCP (для code review PR)
+github:
+  enabled: true
+  token: "ghp_your_github_token_here"
+  owner: "ruslanhafizov"
+  repo: "zayobushek"
+  # Путь к github-mcp-server binary (скачать с https://github.com/github/github-mcp-server)
+  mcp_server_path: "/path/to/github-mcp-server"
 

@@ -1,5 +1,6 @@
 import ai.HuggingFaceClient
 import config.ProjectConfig
+import mcp.GitHubMCP
 import mcp.GitMCP
 import mcp.LocalMCP
 import mcp.MCPOrchestrator
@@ -80,6 +81,15 @@ fun main() {
             logger.info { "  ✓ GitMCP зарегистрирован (Git инструменты)" }
         } else {
             logger.info { "  ⏭️ GitMCP отключен в конфиге" }
+        }
+        
+        // Регистрируем GitHubMCP (GitHub API для PR)
+        if (config.github?.enabled == true) {
+            val githubMCP = GitHubMCP(config.github)
+            mcpOrchestrator.registerServer("github", githubMCP)
+            logger.info { "  ✓ GitHubMCP зарегистрирован (GitHub API: ${config.github.owner}/${config.github.repo})" }
+        } else {
+            logger.info { "  ⏭️ GitHubMCP отключен в конфиге" }
         }
         
         logger.info { "✅ MCP серверов зарегистрировано: ${mcpOrchestrator.getServerCount()}" }
