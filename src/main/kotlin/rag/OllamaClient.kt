@@ -159,3 +159,4 @@ data class OllamaEmbedResponse(
     val embedding: List<Double>
 )
 
+

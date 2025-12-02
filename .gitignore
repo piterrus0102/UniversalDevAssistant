@@ -27,3 +27,4 @@ Thumbs.db
 # RAG Index Cache
 src/main/kotlin/rag/index.json
 
+

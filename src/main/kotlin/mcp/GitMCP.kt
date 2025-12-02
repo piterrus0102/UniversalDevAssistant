@@ -296,3 +296,4 @@ data class GitInfo(
     val remote: String
 )
 
+
