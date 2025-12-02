@@ -82,6 +82,11 @@ fun main() {
             logger.info { "  ⏭️ GitMCP отключен в конфиге" }
         }
         
+        // Регистрируем CodeReviewMCP (code review)
+        val codeReviewMCP = mcp.CodeReviewMCP(config, rag)
+        mcpOrchestrator.registerServer("code-review", codeReviewMCP)
+        logger.info { "  ✓ CodeReviewMCP зарегистрирован (AI Code Review)" }
+        
         logger.info { "✅ MCP серверов зарегистрировано: ${mcpOrchestrator.getServerCount()}" }
         logger.info { "✅ Компоненты инициализированы" }
         
