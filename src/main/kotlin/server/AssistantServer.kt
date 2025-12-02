@@ -16,9 +16,14 @@ import io.ktor.server.request.*
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import mcp.GitMCP
+import mcp.LocalMCP
+import mcp.MCPContentType
 import mcp.MCPOrchestrator
 import mu.KotlinLogging
 
@@ -44,220 +49,13 @@ class AssistantServer(
     // Оригинальный запрос пользователя (для реранкинга)
     @Volatile
     private var lastUserQuery: String = ""
-    
-    /**
-     * Очистка ответа от артефактов (JSON tool calls, комментариев и т.д.)
-     */
-    private fun cleanResponse(response: String): String {
-        var cleaned = response.trim()
-        
-        // Убираем JSON tool calls если они попали в ответ
-        cleaned = cleaned.replace(Regex("""\{"tool":\s*"[^"]+",\s*"args":\s*\{[^}]*\}\}"""), "")
-        
-        // Убираем markdown json блоки
-        cleaned = cleaned.replace(Regex("""```json.*?```""", RegexOption.DOT_MATCHES_ALL), "")
-        
-        // Убираем комментарии в квадратных скобках типа [сервер вызывает tool...]
-        cleaned = cleaned.replace(Regex("""\[.*?\]"""), "")
-        
-        // Убираем префиксы типа "A:", "Assistant:", "Ответ:"
-        cleaned = cleaned.replace(Regex("""^(A:|Assistant:|Ответ:)\s*""", RegexOption.MULTILINE), "")
-        
-        // Убираем лишние пустые строки
-        cleaned = cleaned.replace(Regex("""\n{3,}"""), "\n\n")
-        
-        return cleaned.trim()
-    }
-    
-    /**
-     * Вызов LLM с поддержкой MCP tool calling
-     **
-     * Workflow:
-     * 1. Собираем tools от всех MCP серверов
-     * 2. Формируем system prompt с описанием tools
-     * 3. Отправляем в LLM
-     * 4. Парсим ответ на наличие USE_TOOL:
-     * 5. Если есть - вызываем tool, отправляем результат обратно в LLM
-     * 6. Повторяем пока не получим финальный ответ
-     */
-    private suspend fun callLLMWithTools(userMessage: String): String {
-        // Сохраняем оригинальный запрос пользователя для возможного реранкинга
-        lastUserQuery = userMessage
-        
-        logger.info { "🤖 Вызов LLM с MCP tools..." }
-        
-        // 1. Собираем tools от всех MCP серверов
-        val tools = mcpOrchestrator.getAllTools()
-        logger.debug { "📋 Доступно tools: ${tools.size}" }
-        tools.forEach { logger.debug { "  - ${it.name}" } }
-        
-        // 2. Формируем system prompt (с учетом ожидания жалоб)
-        val systemPrompt = SystemPrompts.createSystemMessage(config, tools, expectingIncorrectRAG)
-        
-        // 3. Формируем сообщения для LLM
-        val messages = mutableListOf(
-            HFMessage(role = "system", content = systemPrompt),
-            HFMessage(role = "user", content = userMessage)
-        )
-        
-        var currentResponse = aiClient.ask(messages)
-        
-        logger.info { "📥 Ответ LLM получен" }
-        val usedTools = mutableListOf<String>()
-        val allTools = tools.map { it.name }
-        
-        // Tool calling loop: пытаемся распарсить ответ как JSON
-        while (true) {
-            // ===== ПРОВЕРКА НА INCORRECT_RAG_ANSWER =====
-            if (expectingIncorrectRAG && currentResponse.trim() == "INCORRECT_RAG_ANSWER") {
-                logger.info { "🚨 INCORRECT_RAG_ANSWER ОБНАРУЖЕН!" }
-                logger.info { "Пользователь недоволен ответом, запускаю РЕРАНКИНГ..." }
-                
-                // Выключаем детекцию
-                expectingIncorrectRAG = false
-                
-                // Запускаем реранкинг через MCP tool
-                try {
-                    logger.info { "🔄 Вызов tool: rerank_search с оригинальным запросом" }
-                    
-                    // Используем сохраненный оригинальный запрос (до жалобы "не то")
-                    // Ищем второй с конца user message (предыдущий запрос перед жалобой)
-                    val originalQuery = messages.asReversed()
-                        .filter { it.role == "user" }
-                        .drop(1)  // Пропускаем текущий запрос (жалобу)
-                        .firstOrNull()?.content ?: lastUserQuery
-                    
-                    logger.info { "Оригинальный запрос для реранкинга: \"$originalQuery\"" }
-                    logger.info { "Текущий запрос (жалоба): \"$userMessage\"" }
-                    
-                    val rerankResult = mcpOrchestrator.callTool("rerank_search", mapOf("query" to originalQuery))
-                    val rerankText = rerankResult.content.firstOrNull()?.text ?: "Не удалось улучшить результаты"
-                    
-                    logger.info { "📦 Результат реранкинга получен (${rerankText.length} chars)" }
-                    
-                    // Используем формат как в createToolResultMessage
-                    val formattedResult = """Результат инструмента rerank_search (улучшенный поиск с LLM оценкой):
-$rerankText
 
-🎯 КРИТИЧЕСКИ ВАЖНО - ОТВЕТЬ ПОЛЬЗОВАТЕЛЮ:
-
-1. ✅ Используй БУКВАЛЬНО информацию из результата выше
-2. ✅ Если в результате есть список - ПЕРЕПИШИ ЕГО ПОЛНОСТЬЮ, не сокращай!
-3. ✅ НЕ придумывай, НЕ додумывай - ТОЛЬКО то что написано выше
-4. ✅ Верни ОБЫЧНЫЙ ТЕКСТОВЫЙ ответ на РУССКОМ языке (НЕ JSON!)
-5. ✅ В КОНЦЕ добавь "📚 Источники:" со списком файлов из результата
-
-❌ НЕ ПИШИ НА КИТАЙСКОМ! Только русский!
-❌ НЕ выдумывай информацию которой нет в результате!
-
-Если в результате есть полный список (например, endpoints) - СКОПИРУЙ ЕГО ВЕСЬ!"""
-                    
-                    messages.add(HFMessage(role = "assistant", content = currentResponse))
-                    messages.add(HFMessage(role = "user", content = formattedResult))
-                    
-                    logger.info { "📨 Отправляем улучшенные результаты в LLM..." }
-                    currentResponse = aiClient.ask(messages)
-                    logger.info { "✅ Реранкинг завершен, получен новый ответ (${currentResponse.length} chars)" }
-                    
-                    // НЕ делаем continue - выходим из цикла с новым ответом
-                    break
-                    
-                } catch (e: Exception) {
-                    logger.error(e) { "❌ Ошибка реранкинга" }
-                    return "Извините, произошла ошибка при попытке улучшить результаты поиска: ${e.message}"
-                }
-            }
-            
-            // Извлекаем JSON из markdown блока если есть
-            var jsonText = currentResponse.trim()
-            
-            // Если ответ в markdown блоке ```json ... ``` - извлекаем JSON
-            val markdownJsonRegex = Regex("""```json\s*(\{.*?\})\s*```""", RegexOption.DOT_MATCHES_ALL)
-            val markdownMatch = markdownJsonRegex.find(jsonText)
-            if (markdownMatch != null) {
-                jsonText = markdownMatch.groupValues[1].trim()
-                logger.debug { "📦 Извлечен JSON из markdown блока" }
-            }
-            
-            // Пытаемся распарсить как ToolCall
-            val toolCall = try {
-                json.decodeFromString<ToolCall>(jsonText)
-            } catch (e: Exception) {
-                // Не JSON или не ToolCall - значит это финальный ответ
-                logger.debug { "Ответ не является tool call, это финальный ответ" }
-                null
-            }
-            
-            // Если не tool call - выходим из цикла
-            if (toolCall == null) break
-            
-            logger.info { "🔧 Tool call: ${toolCall.tool}(${toolCall.args})" }
-            
-            // Проверяем что tool существует
-            if (!allTools.contains(toolCall.tool)) {
-                val errorMsg = SystemPrompts.createToolNotFoundMessage(toolCall.tool, allTools)
-                messages.add(HFMessage(role = "assistant", content = currentResponse))
-                messages.add(HFMessage(role = "user", content = errorMsg))
-                
-                currentResponse = aiClient.ask(messages)
-                continue
-            }
-            
-            // Вызываем tool
-            try {
-                logger.info { "⚙️ Вызов tool: ${toolCall.tool}" }
-                val argsAsAny: Map<String, Any> = toolCall.args.mapValues { it.value as Any }
-                val result = mcpOrchestrator.callTool(toolCall.tool, argsAsAny)
-                val resultText = result.content.firstOrNull()?.text ?: "No result"
-                
-                usedTools.add(toolCall.tool)
-                logger.info { "✅ Tool ${toolCall.tool} выполнен" }
-                logger.info { "📄 Результат tool (первые 300 символов): ${resultText.take(300)}..." }
-                
-                // Если это был search_knowledge_base - включаем детекцию жалоб
-                if (toolCall.tool == "search_knowledge_base") {
-                    expectingIncorrectRAG = true
-                    logger.info { "🔔 Детекция INCORRECT_RAG_ANSWER ВКЛЮЧЕНА (после search_knowledge_base)" }
-                }
-                
-                // Отправляем результат обратно в LLM
-                val formattedResult = SystemPrompts.createToolResultMessage(toolCall.tool, resultText)
-                logger.info { "📨 Отправляем результат в LLM (${formattedResult.length} chars)" }
-                
-                messages.add(HFMessage(role = "assistant", content = currentResponse))
-                messages.add(HFMessage(role = "user", content = formattedResult))
-                
-                logger.info { "🔄 Повторный запрос к LLM с результатом tool..." }
-                currentResponse = aiClient.ask(messages)
-                logger.info { "📥 Ответ LLM после tool: ${currentResponse.take(200)}..." }
-                
-            } catch (e: Exception) {
-                logger.error(e) { "❌ Ошибка вызова tool ${toolCall.tool}" }
-                val errorMsg = "ERROR при вызове ${toolCall.tool}: ${e.message}"
-                messages.add(HFMessage(role = "assistant", content = currentResponse))
-                messages.add(HFMessage(role = "user", content = errorMsg))
-                
-                currentResponse = aiClient.ask(messages)
-            }
-        }
-        
-        if (usedTools.isNotEmpty()) {
-            logger.info { "✅ Использовано tools: ${usedTools.joinToString(" → ")}" }
-        }
-        
-        // Очищаем ответ от артефактов
-        val cleanedResponse = cleanResponse(currentResponse)
-        logger.debug { "🧹 Ответ после очистки (${cleanedResponse.length} chars)" }
-        
-        return cleanedResponse
-    }
-    
     fun start() {
         logger.info { "🌐 Запуск HTTP сервера..." }
         
         embeddedServer(Netty, port = config.server.port, host = config.server.host) {
             install(ContentNegotiation) {
-                json()
+                json(Json { ignoreUnknownKeys = true })
             }
             
             routing {
@@ -269,17 +67,6 @@ $rerankText
                         
                         Проект: ${config.project.name}
                         Путь: ${config.project.path}
-                        
-                        Доступные endpoints:
-                        - GET  /health          - Проверка работоспособности (MCP серверов)
-                        - GET  /help?q=вопрос   - Задать вопрос о проекте (MCP + AI Agent)
-                        - POST /reindex         - Переиндексация документации
-                        
-                        MCP Architecture:
-                        - LocalMCP: search_knowledge_base (RAG поиск по документации)
-                        - GitMCP: get_git_status, get_git_branch, get_git_commits, get_git_diff
-                        
-                        AI Agent автоматически выбирает нужные инструменты!
                         """.trimIndent(),
                         ContentType.Text.Plain
                     )
@@ -307,24 +94,17 @@ $rerankText
                         logger.info { "🔄 Запущена переиндексация документации..." }
                         
                         val startTime = System.currentTimeMillis()
-                        
-                        // Вызываем через MCP tool
                         val result = runBlocking {
                             try {
-                                mcpOrchestrator.callTool("reindex_documents", emptyMap())
+                                mcpOrchestrator.callTool(LocalMCP.REINDEX_DOCUMENTS_TOOL_NAME, emptyMap())
                                 "success"
                             } catch (e: Exception) {
-                                // Если tool не существует - значит нужна прямая реиндексация
-                                // (это нормально, т.к. reindex не обязательный tool)
                                 logger.warn { "Tool reindex_documents не найден, пропускаем" }
                                 "skipped"
                             }
                         }
-                        
                         val duration = System.currentTimeMillis() - startTime
-                        
                         logger.info { "✅ Переиндексация завершена за ${duration}ms" }
-                        
                         call.respond(
                             ReindexResponse(
                                 status = result,
@@ -341,7 +121,6 @@ $rerankText
                     }
                 }
                 
-                // /help?q=вопрос - главная фишка! (MCP + Tool Calling)
                 get("/help") {
                     val question = call.request.queryParameters["q"]
                     
@@ -356,13 +135,6 @@ $rerankText
                     logger.info { "❓ Вопрос: $question" }
                     
                     try {
-                        // Новая MCP архитектура:
-                        // 1. LLM получает вопрос + список tools
-                        // 2. LLM решает какие tools вызвать (USE_TOOL:)
-                        // 3. Вызываем tools через orchestrator
-                        // 4. Результаты обратно в LLM
-                        // 5. Финальный ответ
-                        
                         val answer = runBlocking {
                             callLLMWithTools(question)
                         }
@@ -389,7 +161,7 @@ $rerankText
                 // Git информация
                 get("/git/info") {
                     try {
-                        if (!config.git.enabled) {
+                        if (config.git.enabled.not()) {
                             call.respond(
                                 ErrorResponse("Git интеграция отключена")
                             )
@@ -397,22 +169,15 @@ $rerankText
                         }
                         
                         val status = runBlocking {
-                            mcpOrchestrator.callTool("get_git_status", emptyMap())
+                            mcpOrchestrator.callTool(GitMCP.GET_GIT_STATUS_TOOL_NAME, emptyMap())
                         }
                         val statusText = status.content.firstOrNull()?.text ?: ""
                         
-                        // Парсинг git status (формат: "Git Status:\n  Branch: main\n  Last Commit: ...")
-                        val branchRegex = Regex("""Branch:\s*(.+)""")
-                        val commitRegex = Regex("""Last Commit:\s*(.+)""")
-                        
-                        val branch = branchRegex.find(statusText)?.groupValues?.get(1)?.trim() ?: "unknown"
-                        val lastCommit = commitRegex.find(statusText)?.groupValues?.get(1)?.trim() ?: ""
-                        
                         call.respond(
                             GitInfoResponse(
-                                currentBranch = branch,
+                                currentBranch = status.content.first { it.type == MCPContentType.currentBranch }.text,
                                 status = statusText,
-                                lastCommit = lastCommit
+                                lastCommit = status.content.first { it.type == MCPContentType.lastCommit }.text,
                             )
                         )
                     } catch (e: Exception) {
@@ -435,7 +200,7 @@ $rerankText
                         }
                         
                         val result = runBlocking {
-                            mcpOrchestrator.callTool("get_git_branch", emptyMap())
+                            mcpOrchestrator.callTool(GitMCP.GET_GIT_BRANCH_TOOL_NAME, emptyMap())
                         }
                         val branchText = result.content.firstOrNull()?.text ?: "unknown"
                         
@@ -496,7 +261,7 @@ $rerankText
                 }
                 
                 // POST /review - AI Code Review
-                // AI САМ вызывает get_code_changes и search_knowledge_base!
+                // AI САМ запрашивает diff через GitHubMCP и документацию через LocalMCP!
                 post("/review") {
                     try {
                         val request = call.receive<CodeReviewRequest>()
@@ -507,67 +272,85 @@ $rerankText
                         val tools = mcpOrchestrator.getAllTools()
                         val systemPrompt = ai.SystemPrompts.createCodeReviewSystemMessage(config, tools)
                         
-                        // Формируем запрос для AI
+                        // AI получает только номер PR - сам запросит diff и доки!
                         val userQuery = """
-Проведи code review для Pull Request #${request.pr_number}: ${request.pr_title}
-
-Автор: ${request.pr_author}
-Изменено файлов: ${request.changed_files.size}
-
-Используй инструменты:
-1. get_code_changes - получить код PR
-2. search_knowledge_base - найти Code Conventions
-
-Проверь:
-- Безопасность (SQL injection, XSS)
-- Code Conventions
-- Потенциальные баги
-""".trim()
+                                Ты - профессиональный ревьюер кода, знаешь все code conventions языков программирования
+                                Проведи code review для Pull Request #${request.pr_number}
+                                
+                                Тебе нужно:
+                                1. Получить информацию о PR и diff через инструменты
+                                2. Запросить документацию по проекту чтоб оценить соответствие
+                                3. Проанализировать код на соответствие правилам
+                                4. Выдать структурированный review
+                                
+                                Необязательно чтоб там были замечания, 
+                                """.trim()
                         
                         val messages = mutableListOf(
                             ai.HFMessage(role = "system", content = systemPrompt),
                             ai.HFMessage(role = "user", content = userQuery)
                         )
                         
-                        logger.info { "🤖 AI должен сам вызвать tools" }
+                        logger.info { "🤖 AI сам вызовет tools для получения данных" }
                         
                         var response = aiClient.ask(messages)
                         val usedTools = mutableListOf<String>()
                         var iteration = 0
                         val maxIterations = 10
                         
-                        // Tool calling loop
+                        // Tool calling loop - AI сам решает какие tools вызвать
                         while (iteration < maxIterations) {
                             iteration++
+
+                            logger.debug { "📦 Ответ AI: $response" }
                             
-                            val toolCall = try {
-                                json.decodeFromString<ToolCall>(response.trim())
+                            // Парсим {"tools": [...]} формат
+                            val toolsResponse = try {
+                                json.decodeFromString<ToolsResponse>(response)
                             } catch (e: Exception) {
-                                // Финальный ответ
+                                // Fallback: пробуем старый формат {"tool": "...", "args": {...}}
+                                try {
+                                    val singleTool = json.decodeFromString<ToolCall>(response)
+                                    ToolsResponse(tools = listOf(singleTool))
+                                } catch (e2: Exception) {
+                                    logger.debug { "Нет tool вызовов, финальный ответ" }
+                                    break
+                                }
+                            }
+                            
+                            if (toolsResponse.tools.isEmpty()) {
+                                logger.debug { "Пустой массив tools, финальный ответ" }
                                 break
                             }
                             
-                            logger.info { "🔧 Tool #$iteration: ${toolCall.tool}" }
+                            logger.info { "🔧 Iteration #$iteration: ${toolsResponse.tools.size} tool(s)" }
                             
-                            val toolArgs: Map<String, Any> = when (toolCall.tool) {
-                                "get_code_changes" -> mapOf(
-                                    "pr_number" to request.pr_number,
-                                    "pr_title" to request.pr_title,
-                                    "diff" to request.diff,
-                                    "changed_files" to request.changed_files,
-                                    "files_content" to (request.files_content ?: emptyMap<String, String>())
-                                )
-                                else -> toolCall.args
+                            // Выполняем ВСЕ tools из массива
+                            val results = mutableListOf<String>()
+                            for (toolCall in toolsResponse.tools) {
+                                val toolArgs = toolCall.argsToMap().toMutableMap()
+                                
+                                // Если tool требует pr_number но AI его не передал - подставляем из request
+                                if (toolCall.tool.contains("pr_", ignoreCase = true) && !toolArgs.containsKey("pr_number")) {
+                                    toolArgs["pr_number"] = request.pr_number
+                                }
+                                
+                                try {
+                                    val result = mcpOrchestrator.callTool(toolCall.tool, toolArgs)
+                                    val resultText = result.content.firstOrNull()?.text ?: ""
+                                    
+                                    usedTools.add(toolCall.tool)
+                                    results.add("📌 ${toolCall.tool}:\n$resultText")
+                                    logger.info { "✅ ${toolCall.tool} выполнен (${resultText.length} chars)" }
+                                } catch (e: Exception) {
+                                    logger.error(e) { "❌ Ошибка вызова tool ${toolCall.tool}" }
+                                    results.add("📌 ${toolCall.tool}: ERROR - ${e.message}")
+                                }
                             }
                             
-                            val result = mcpOrchestrator.callTool(toolCall.tool, toolArgs)
-                            val resultText = result.content.firstOrNull()?.text ?: ""
-                            
-                            usedTools.add(toolCall.tool)
-                            logger.info { "✅ ${toolCall.tool} выполнен (${resultText.length} chars)" }
-                            
+                            // Отправляем все результаты одним сообщением
                             messages.add(ai.HFMessage(role = "assistant", content = response))
-                            messages.add(ai.HFMessage(role = "user", content = "Результат '${toolCall.tool}':\n$resultText"))
+                            messages.add(ai.HFMessage(role = "user", content = "Результаты tools:\n\n${results.joinToString("\n\n")}"))
                             
                             response = aiClient.ask(messages)
                         }
@@ -578,8 +361,7 @@ $rerankText
                             CodeReviewResponse(
                                 pr_number = request.pr_number,
                                 review = response,
-                                summary = "Tools used: ${usedTools.joinToString(", ")}",
-                                files_analyzed = request.changed_files.size
+                                tools_used = usedTools
                             )
                         )
                         
@@ -596,6 +378,187 @@ $rerankText
         
         logger.info { "🚀 Сервер запущен на http://${config.server.host}:${config.server.port}" }
     }
+
+    /**
+     * Вызов LLM с поддержкой MCP tool calling
+     **
+     * Workflow:
+     * 1. Собираем tools от всех MCP серверов
+     * 2. Формируем system prompt с описанием tools
+     * 3. Отправляем в LLM
+     * 4. Парсим ответ на наличие USE_TOOL:
+     * 5. Если есть - вызываем tool, отправляем результат обратно в LLM
+     * 6. Повторяем пока не получим финальный ответ
+     */
+    private suspend fun callLLMWithTools(userMessage: String): String {
+        // Сохраняем оригинальный запрос пользователя для возможного реранкинга
+        lastUserQuery = userMessage
+
+        logger.info { "🤖 Вызов LLM с MCP tools..." }
+
+        // 1. Собираем tools от всех MCP серверов
+        val tools = mcpOrchestrator.getAllTools()
+        logger.debug { "📋 Доступно tools: ${tools.size}" }
+        tools.forEach { logger.info { "  - ${it.name}" } }
+
+        // 2. Формируем system prompt (с учетом ожидания жалоб)
+        val systemPrompt = SystemPrompts.createSystemMessage(config, tools, expectingIncorrectRAG)
+
+        // 3. Формируем сообщения для LLM
+        val messages = mutableListOf(
+            HFMessage(role = "system", content = systemPrompt),
+            HFMessage(role = "user", content = userMessage)
+        )
+
+        var currentResponse = aiClient.ask(messages)
+
+        logger.info { "📥 Ответ LLM получен" }
+        val usedTools = mutableListOf<String>()
+        val allTools = tools.map { it.name }
+
+        // Tool calling loop: пытаемся распарсить ответ как JSON
+        while (true) {
+            // ===== ПРОВЕРКА НА INCORRECT_RAG_ANSWER =====
+            if (expectingIncorrectRAG && currentResponse.trim() == "INCORRECT_RAG_ANSWER") {
+                logger.info { "🚨 INCORRECT_RAG_ANSWER ОБНАРУЖЕН!" }
+                logger.info { "Пользователь недоволен ответом, запускаю РЕРАНКИНГ..." }
+
+                // Выключаем детекцию
+                expectingIncorrectRAG = false
+
+                // Запускаем реранкинг через MCP tool
+                try {
+                    logger.info { "🔄 Вызов tool: rerank_search с оригинальным запросом" }
+
+                    // Используем сохраненный оригинальный запрос (до жалобы "не то")
+                    // Ищем второй с конца user message (предыдущий запрос перед жалобой)
+                    val originalQuery = messages.asReversed()
+                        .filter { it.role == "user" }
+                        .drop(1)  // Пропускаем текущий запрос (жалобу)
+                        .firstOrNull()?.content ?: lastUserQuery
+
+                    logger.info { "Оригинальный запрос для реранкинга: \"$originalQuery\"" }
+                    logger.info { "Текущий запрос (жалоба): \"$userMessage\"" }
+
+                    val rerankResult = mcpOrchestrator.callTool(LocalMCP.RERANK_SEARCH_TOOL_NAME, mapOf("query" to originalQuery))
+                    val rerankText = rerankResult.content.firstOrNull()?.text ?: "Не удалось улучшить результаты"
+
+                    logger.info { "📦 Результат реранкинга получен (${rerankText.length} chars)" }
+
+                    // Используем формат как в createToolResultMessage
+                    val formattedResult = rerankPrompt(rerankText)
+
+                    messages.add(HFMessage(role = "assistant", content = currentResponse))
+                    messages.add(HFMessage(role = "user", content = formattedResult))
+
+                    logger.info { "📨 Отправляем улучшенные результаты в LLM..." }
+                    currentResponse = aiClient.ask(messages)
+                    logger.info { "✅ Реранкинг завершен, получен новый ответ (${currentResponse.length} chars)" }
+
+                    // НЕ делаем continue - выходим из цикла с новым ответом
+                    break
+
+                } catch (e: Exception) {
+                    logger.error(e) { "❌ Ошибка реранкинга" }
+                    return "Извините, произошла ошибка при попытке улучшить результаты поиска: ${e.message}"
+                }
+            }
+
+            // Парсим {"tools": [...]} формат
+            val toolsResponse = try {
+                json.decodeFromString<ToolsResponse>(currentResponse)
+            } catch (e: Exception) {
+                // Fallback: пробуем старый формат {"tool": "...", "args": {...}}
+                try {
+                    val singleTool = json.decodeFromString<ToolCall>(currentResponse)
+                    ToolsResponse(tools = listOf(singleTool))
+                } catch (e2: Exception) {
+                    logger.debug { "Нет tool вызовов, финальный ответ" }
+                    break
+                }
+            }
+            
+            if (toolsResponse.tools.isEmpty()) {
+                logger.debug { "Пустой массив tools, финальный ответ" }
+                break
+            }
+
+            logger.info { "🔧 Tool calls: ${toolsResponse.tools.map { it.tool }}" }
+
+            // Выполняем ВСЕ tools из массива
+            val results = mutableListOf<String>()
+            for (toolCall in toolsResponse.tools) {
+                // Проверяем что tool существует
+                if (!allTools.contains(toolCall.tool)) {
+                    results.add("📌 ${toolCall.tool}: ERROR - инструмент не существует")
+                    continue
+                }
+
+                // Вызываем tool
+                try {
+                    logger.info { "⚙️ Вызов tool: ${toolCall.tool}" }
+                    val argsAsAny: Map<String, Any> = toolCall.argsToMap()
+                    val result = mcpOrchestrator.callTool(toolCall.tool, argsAsAny)
+                    val resultText = result.content.firstOrNull()?.text ?: "No result"
+
+                    usedTools.add(toolCall.tool)
+                    results.add("📌 ${toolCall.tool}:\n$resultText")
+                    logger.info { "✅ Tool ${toolCall.tool} выполнен (${resultText.length} chars)" }
+
+                    // Если это был search_knowledge_base - включаем детекцию жалоб
+                    if (toolCall.tool == LocalMCP.SEARCH_KNOWLEDGE_BASE_TOOL_NAME) {
+                        expectingIncorrectRAG = true
+                        logger.info { "🔔 Детекция INCORRECT_RAG_ANSWER ВКЛЮЧЕНА" }
+                    }
+
+                } catch (e: Exception) {
+                    logger.error(e) { "❌ Ошибка вызова tool ${toolCall.tool}" }
+                    results.add("📌 ${toolCall.tool}: ERROR - ${e.message}")
+                }
+            }
+
+            // Отправляем все результаты одним сообщением
+            val formattedResult = SystemPrompts.createToolResultMessage(
+                toolsResponse.tools.joinToString(", ") { it.tool },
+                results.joinToString("\n\n")
+            )
+            logger.info { "📨 Отправляем результаты ${toolsResponse.tools.size} tools в LLM" }
+
+            messages.add(HFMessage(role = "assistant", content = currentResponse))
+            messages.add(HFMessage(role = "user", content = formattedResult))
+
+            logger.info { "🔄 Повторный запрос к LLM с результатами tools..." }
+            currentResponse = aiClient.ask(messages)
+            logger.info { "📥 Ответ LLM после tools: ${currentResponse.take(200)}..." }
+        }
+
+        if (usedTools.isNotEmpty()) {
+            logger.info { "✅ Использовано tools: ${usedTools.joinToString(" → ")}" }
+        }
+
+        logger.debug { "🧹 Ответ после очистки (${currentResponse.length} chars)" }
+
+        return currentResponse
+    }
+
+}
+
+private fun rerankPrompt(rerankText: String): String {
+    return """Результат инструмента rerank_search (улучшенный поиск с LLM оценкой):
+$rerankText
+
+🎯 КРИТИЧЕСКИ ВАЖНО - ОТВЕТЬ ПОЛЬЗОВАТЕЛЮ:
+
+1. ✅ Используй БУКВАЛЬНО информацию из результата выше
+2. ✅ Если в результате есть список - ПЕРЕПИШИ ЕГО ПОЛНОСТЬЮ, не сокращай!
+3. ✅ НЕ придумывай, НЕ додумывай - ТОЛЬКО то что написано выше
+4. ✅ Верни ОБЫЧНЫЙ ТЕКСТОВЫЙ ответ на РУССКОМ языке (НЕ JSON!)
+5. ✅ В КОНЦЕ добавь "📚 Источники:" со списком файлов из результата
+
+❌ НЕ ПИШИ НА КИТАЙСКОМ! Только русский!
+❌ НЕ выдумывай информацию которой нет в результате!
+
+Если в результате есть полный список (например, endpoints) - СКОПИРУЙ ЕГО ВЕСЬ!"""
 }
 
 // ============================================================================
@@ -603,85 +566,46 @@ $rerankText
 // ============================================================================
 
 /**
+ * Ответ с массивом tool calls от LLM
+ * Формат: {"tools": [{"tool": "name", "args": {...}}, ...]}
+ */
+@Serializable
+data class ToolsResponse(
+    val tools: List<ToolCall>
+)
+
+/**
  * Tool call от LLM (чистый JSON когда нужен инструмент)
+ * args может содержать разные типы: String, Int, Array, Object
  */
 @Serializable
 data class ToolCall(
     val tool: String,
-    val args: Map<String, String> = emptyMap()
-)
-
-// ============================================================================
-// Response Models
-// ============================================================================
-
-@Serializable
-data class HealthResponse(
-    val status: String,
-    val project: String,
-    val mcpServers: Int,
-    val mcpServerNames: List<String>,
-    val gitEnabled: Boolean
-)
-
-@Serializable
-data class HelpResponse(
-    val project: String,
-    val question: String,
-    val answer: String
-)
-
-@Serializable
-data class ErrorResponse(
-    val error: String
-)
-
-@Serializable
-data class ReindexResponse(
-    val status: String,
-    val message: String,
-    val durationMs: Long
-)
-
-@Serializable
-data class GitInfoResponse(
-    val currentBranch: String,
-    val status: String,
-    val lastCommit: String
-)
-
-@Serializable
-data class GitBranchResponse(
-    val branch: String
-)
-
-@Serializable
-data class DocsResponse(
-    val count: Int,
-    val documents: List<DocInfo>
-)
-
-@Serializable
-data class DocInfo(
-    val path: String
-)
-
-@Serializable
-data class CodeReviewRequest(
-    val pr_number: Int,
-    val pr_title: String,
-    val pr_author: String,
-    val diff: String,
-    val changed_files: List<String>,
-    val files_content: Map<String, String>? = null,
-    val metadata: Map<String, String>? = null
-)
-
-@Serializable
-data class CodeReviewResponse(
-    val pr_number: Int,
-    val review: String,
-    val summary: String,
-    val files_analyzed: Int
-)
-
+    val args: JsonObject = JsonObject(emptyMap())
+) {
+    /**
+     * Конвертирует args в Map<String, Any> для вызова MCP tool
+     */
+    fun argsToMap(): Map<String, Any> {
+        return args.mapValues { (_, value) ->
+            when (value) {
+                is kotlinx.serialization.json.JsonPrimitive -> {
+                    if (value.isString) {
+                        value.content
+                    } else {
+                        // Пробуем распарсить как число или boolean
+                        value.content.toIntOrNull() 
+                            ?: value.content.toLongOrNull() 
+                            ?: value.content.toDoubleOrNull() 
+                            ?: value.content.toBooleanStrictOrNull()
+                            ?: value.content
+                    }
+                }
+                is JsonArray -> value.map { elem ->
+                    if (elem is kotlinx.serialization.json.JsonPrimitive) elem.content else elem.toString()
+                }
+                is JsonObject -> value.toString()
+            }
+        }
+    }
+}

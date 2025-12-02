@@ -10,6 +10,7 @@ data class ProjectConfig(
     val ai: AIConfig,
     val server: ServerConfig,
     val git: GitConfig,
+    val github: GitHubConfig? = null,
     val vectorization: VectorizationConfig? = null
 ) {
     companion object {
@@ -61,5 +62,14 @@ data class VectorizationConfig(
     val enabled: Boolean,
     val ollama_url: String,
     val model: String
+)
+
+@Serializable
+data class GitHubConfig(
+    val enabled: Boolean = false,
+    val token: String = "",
+    val owner: String = "",
+    val repo: String = "",
+    val mcp_server_path: String? = null  // Путь к github-mcp-server binary
 )
 
