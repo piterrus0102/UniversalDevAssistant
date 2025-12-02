@@ -494,6 +494,103 @@ $rerankText
                         )
                     }
                 }
+                
+                // POST /review - AI Code Review
+                // AI САМ вызывает get_code_changes и search_knowledge_base!
+                post("/review") {
+                    try {
+                        val request = call.receive<CodeReviewRequest>()
+                        
+                        logger.info { "🔍 Code Review: PR #${request.pr_number}" }
+                        
+                        // System prompt для code review
+                        val tools = mcpOrchestrator.getAllTools()
+                        val systemPrompt = ai.SystemPrompts.createCodeReviewSystemMessage(config, tools)
+                        
+                        // Формируем запрос для AI
+                        val userQuery = """
+Проведи code review для Pull Request #${request.pr_number}: ${request.pr_title}
+
+Автор: ${request.pr_author}
+Изменено файлов: ${request.changed_files.size}
+
+Используй инструменты:
+1. get_code_changes - получить код PR
+2. search_knowledge_base - найти Code Conventions
+
+Проверь:
+- Безопасность (SQL injection, XSS)
+- Code Conventions
+- Потенциальные баги
+""".trim()
+                        
+                        val messages = mutableListOf(
+                            ai.HFMessage(role = "system", content = systemPrompt),
+                            ai.HFMessage(role = "user", content = userQuery)
+                        )
+                        
+                        logger.info { "🤖 AI должен сам вызвать tools" }
+                        
+                        var response = aiClient.ask(messages)
+                        val usedTools = mutableListOf<String>()
+                        var iteration = 0
+                        val maxIterations = 10
+                        
+                        // Tool calling loop
+                        while (iteration < maxIterations) {
+                            iteration++
+                            
+                            val toolCall = try {
+                                json.decodeFromString<ToolCall>(response.trim())
+                            } catch (e: Exception) {
+                                // Финальный ответ
+                                break
+                            }
+                            
+                            logger.info { "🔧 Tool #$iteration: ${toolCall.tool}" }
+                            
+                            val toolArgs: Map<String, Any> = when (toolCall.tool) {
+                                "get_code_changes" -> mapOf(
+                                    "pr_number" to request.pr_number,
+                                    "pr_title" to request.pr_title,
+                                    "diff" to request.diff,
+                                    "changed_files" to request.changed_files,
+                                    "files_content" to (request.files_content ?: emptyMap<String, String>())
+                                )
+                                else -> toolCall.args
+                            }
+                            
+                            val result = mcpOrchestrator.callTool(toolCall.tool, toolArgs)
+                            val resultText = result.content.firstOrNull()?.text ?: ""
+                            
+                            usedTools.add(toolCall.tool)
+                            logger.info { "✅ ${toolCall.tool} выполнен (${resultText.length} chars)" }
+                            
+                            messages.add(ai.HFMessage(role = "assistant", content = response))
+                            messages.add(ai.HFMessage(role = "user", content = "Результат '${toolCall.tool}':\n$resultText"))
+                            
+                            response = aiClient.ask(messages)
+                        }
+                        
+                        logger.info { "✅ Review завершен. Tools: ${usedTools.joinToString(", ")}" }
+                        
+                        call.respond(
+                            CodeReviewResponse(
+                                pr_number = request.pr_number,
+                                review = response,
+                                summary = "Tools used: ${usedTools.joinToString(", ")}",
+                                files_analyzed = request.changed_files.size
+                            )
+                        )
+                        
+                    } catch (e: Exception) {
+                        logger.error(e) { "❌ Code review error" }
+                        call.respond(
+                            HttpStatusCode.InternalServerError,
+                            ErrorResponse("Error: ${e.message}")
+                        )
+                    }
+                }
             }
         }.start(wait = true)
         
@@ -567,5 +664,24 @@ data class DocsResponse(
 @Serializable
 data class DocInfo(
     val path: String
+)
+
+@Serializable
+data class CodeReviewRequest(
+    val pr_number: Int,
+    val pr_title: String,
+    val pr_author: String,
+    val diff: String,
+    val changed_files: List<String>,
+    val files_content: Map<String, String>? = null,
+    val metadata: Map<String, String>? = null
+)
+
+@Serializable
+data class CodeReviewResponse(
+    val pr_number: Int,
+    val review: String,
+    val summary: String,
+    val files_analyzed: Int
 )
 
