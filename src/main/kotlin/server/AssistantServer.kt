@@ -26,6 +26,17 @@ import mcp.LocalMCP
 import mcp.MCPContentType
 import mcp.MCPOrchestrator
 import mu.KotlinLogging
+import server.request_response.CodeReviewRequest
+import server.request_response.CodeReviewResponse
+import server.request_response.DocInfo
+import server.request_response.DocsResponse
+import server.request_response.ErrorResponse
+import server.request_response.GitBranchResponse
+import server.request_response.GitInfoResponse
+import server.request_response.HealthResponse
+import server.request_response.HelpResponse
+import server.request_response.ReindexResponse
+import server.helper.SupportRequestsContainer
 
 private val logger = KotlinLogging.logger {}
 
@@ -49,6 +60,10 @@ class AssistantServer(
     // Оригинальный запрос пользователя (для реранкинга)
     @Volatile
     private var lastUserQuery: String = ""
+    
+    // Текущая роль ассистента
+    @Volatile
+    private var currentRole: AssistantRole = AssistantRole.COMMON
 
     fun start() {
         logger.info { "🌐 Запуск HTTP сервера..." }
@@ -84,6 +99,105 @@ class AssistantServer(
                             mcpServers = mcpServerCount,
                             mcpServerNames = mcpServers,
                             gitEnabled = config.git.enabled
+                        )
+                    )
+                }
+                
+                // ============================================================================
+                // Управление ролями ассистента
+                // ============================================================================
+                
+                // Получить список всех доступных ролей
+                get("/roles") {
+                    call.respond(
+                        RolesListResponse(
+                            currentRole = currentRole.name,
+                            availableRoles = AssistantRole.getAllRolesInfo()
+                        )
+                    )
+                }
+                
+                // Получить текущую роль
+                get("/role") {
+                    call.respond(
+                        CurrentRoleResponse(
+                            currentRole = currentRole.name,
+                            description = currentRole.description
+                        )
+                    )
+                }
+                
+                // Сменить роль: POST /role с телом {"role": "HELPER"}
+                // или GET /role/HELPER
+                post("/role") {
+                    try {
+                        val request = call.receive<ChangeRoleRequest>()
+                        val newRole = AssistantRole.fromName(request.role)
+                        
+                        if (newRole == null) {
+                            call.respond(
+                                HttpStatusCode.BadRequest,
+                                ChangeRoleResponse(
+                                    success = false,
+                                    previousRole = currentRole.name,
+                                    newRole = request.role,
+                                    message = "Неизвестная роль '${request.role}'. Доступные: ${AssistantRole.entries.joinToString { it.name }}"
+                                )
+                            )
+                            return@post
+                        }
+                        
+                        val previousRole = currentRole
+                        currentRole = newRole
+                        
+                        logger.info { "🔄 Роль изменена: ${previousRole.name} → ${newRole.name}" }
+                        
+                        call.respond(
+                            ChangeRoleResponse(
+                                success = true,
+                                previousRole = previousRole.name,
+                                newRole = newRole.name,
+                                message = "Роль успешно изменена на ${newRole.displayName}"
+                            )
+                        )
+                    } catch (e: Exception) {
+                        logger.error(e) { "Ошибка смены роли" }
+                        call.respond(
+                            HttpStatusCode.BadRequest,
+                            ErrorResponse("Ошибка: ${e.message}. Формат: {\"role\": \"HELPER\"}")
+                        )
+                    }
+                }
+                
+                // Альтернативный способ смены роли через URL
+                get("/role/{roleName}") {
+                    val roleName = call.parameters["roleName"] ?: ""
+                    val newRole = AssistantRole.fromName(roleName)
+                    
+                    if (newRole == null) {
+                        call.respond(
+                            HttpStatusCode.BadRequest,
+                            ChangeRoleResponse(
+                                success = false,
+                                previousRole = currentRole.name,
+                                newRole = roleName,
+                                message = "Неизвестная роль '$roleName'. Доступные: ${AssistantRole.entries.joinToString { it.name }}"
+                            )
+                        )
+                        return@get
+                    }
+                    
+                    val previousRole = currentRole
+                    currentRole = newRole
+                    
+                    logger.info { "🔄 Роль изменена: ${previousRole.name} → ${newRole.name}" }
+                    
+                    call.respond(
+                        ChangeRoleResponse(
+                            success = true,
+                            previousRole = previousRole.name,
+                            newRole = newRole.name,
+                            message = "Роль успешно изменена на ${newRole.displayName}"
                         )
                     )
                 }
@@ -373,6 +487,80 @@ class AssistantServer(
                         )
                     }
                 }
+                
+                // ============================================================================
+                // HELPER: Обработка запросов пользователей (поддержка)
+                // ============================================================================
+                
+                // POST /support - обработка запросов пользователей через HELPER
+                post("/support") {
+                    try {
+                        logger.info { "🎫 HELPER: Начало обработки запросов поддержки..." }
+                        
+                        // Читаем requests.json
+                        val requestsFile = java.io.File("src/main/kotlin/server/helper/requests.json")
+                        if (!requestsFile.exists()) {
+                            call.respond(
+                                HttpStatusCode.NotFound,
+                                ErrorResponse("Файл requests.json не найден")
+                            )
+                            return@post
+                        }
+                        
+                        val requestsJson = requestsFile.readText()
+                        val requestsContainer = json.decodeFromString<SupportRequestsContainer>(requestsJson)
+                        
+                        logger.info { "📋 Загружено ${requestsContainer.requests.size} запросов для обработки" }
+                        
+                        // Вызываем LLM с HELPER ролью
+                        val answer = runBlocking {
+                            callHelperLLM(requestsJson)
+                        }
+                        
+                        logger.info { "✅ HELPER завершил обработку" }
+                        logger.info { "📝 Ответ LLM: ${answer.take(500)}..." }
+                        
+                        // Парсим ответ и сохраняем в answers.json
+                        try {
+                            // Очищаем ответ от возможных markdown блоков
+                            val cleanedAnswer = answer
+                                .replace("```json", "")
+                                .replace("```", "")
+                                .trim()
+                            
+                            // Валидируем что это JSON
+                            val answersContainer = json.decodeFromString<SupportRequestsContainer>(cleanedAnswer)
+                            
+                            // Сохраняем в answers.json
+                            val answersFile = java.io.File("src/main/kotlin/server/helper/answers.json")
+                            answersFile.writeText(json.encodeToString(SupportRequestsContainer.serializer(), answersContainer))
+                            
+                            logger.info { "💾 Ответы сохранены в answers.json" }
+                            println("✅ Обработка закончена")
+                            
+                            // Возвращаем тот же JSON с заполненными answer
+                            call.respond(answersContainer)
+                        } catch (e: Exception) {
+                            logger.error(e) { "❌ Ошибка парсинга ответа LLM" }
+                            
+                            // Сохраняем сырой ответ для отладки
+                            val rawFile = java.io.File("src/main/kotlin/server/helper/answers_raw.txt")
+                            rawFile.writeText(answer)
+                            
+                            call.respond(
+                                HttpStatusCode.InternalServerError,
+                                ErrorResponse("Ошибка парсинга ответа LLM: ${e.message}. Сырой ответ сохранён в answers_raw.txt")
+                            )
+                        }
+                        
+                    } catch (e: Exception) {
+                        logger.error(e) { "❌ Ошибка обработки запросов поддержки" }
+                        call.respond(
+                            HttpStatusCode.InternalServerError,
+                            ErrorResponse("Ошибка: ${e.message}")
+                        )
+                    }
+                }
             }
         }.start(wait = true)
         
@@ -538,6 +726,124 @@ class AssistantServer(
 
         logger.debug { "🧹 Ответ после очистки (${currentResponse.length} chars)" }
 
+        return currentResponse
+    }
+    
+    /**
+     * Вызов LLM для HELPER роли (обработка запросов поддержки)
+     * 
+     * Использует только RAG и LocalMCP (без GitHubMCP).
+     * Возвращает JSON с заполненными ответами.
+     */
+    private suspend fun callHelperLLM(requestsJson: String): String {
+        logger.info { "🎫 HELPER: Вызов LLM для обработки запросов поддержки..." }
+        
+        // 1. Собираем tools (фильтруем GitHub-связанные)
+        val allTools = mcpOrchestrator.getAllTools()
+        val helperTools = allTools.filter { tool ->
+            !tool.name.contains("github", ignoreCase = true) &&
+            !tool.name.contains("pr_", ignoreCase = true) &&
+            !tool.name.contains("pull_request", ignoreCase = true)
+        }
+        
+        logger.info { "📋 HELPER tools: ${helperTools.map { it.name }}" }
+        
+        // 2. Формируем system prompt для HELPER
+        val systemPrompt = SystemPrompts.createHelperSystemMessage(config, helperTools, requestsJson)
+        
+        // 3. Формируем сообщения для LLM
+        val messages = mutableListOf(
+            HFMessage(role = "system", content = systemPrompt),
+            HFMessage(role = "user", content = "Обработай запросы пользователей и верни JSON с заполненными ответами.")
+        )
+        
+        var currentResponse = aiClient.ask(messages)
+        logger.info { "📥 HELPER: Ответ LLM получен" }
+        
+        val usedTools = mutableListOf<String>()
+        val helperToolNames = helperTools.map { it.name }
+        var iteration = 0
+        val maxIterations = 15 // Больше итераций для обработки нескольких запросов
+        
+        // Tool calling loop
+        while (iteration < maxIterations) {
+            iteration++
+            
+            // Проверяем - это финальный JSON ответ или tool call?
+            val toolsResponse = try {
+                json.decodeFromString<ToolsResponse>(currentResponse)
+            } catch (e: Exception) {
+                // Пробуем старый формат
+                try {
+                    val singleTool = json.decodeFromString<ToolCall>(currentResponse)
+                    ToolsResponse(tools = listOf(singleTool))
+                } catch (e2: Exception) {
+                    // Это не tool call - проверяем, это финальный JSON?
+                    if (currentResponse.contains("\"requests\"") && currentResponse.contains("\"answer\"")) {
+                        logger.info { "🎯 HELPER: Получен финальный JSON ответ" }
+                        break
+                    }
+                    logger.debug { "HELPER: Нет tool вызовов, проверяем ответ..." }
+                    break
+                }
+            }
+            
+            if (toolsResponse.tools.isEmpty()) {
+                logger.debug { "HELPER: Пустой массив tools" }
+                break
+            }
+            
+            logger.info { "🔧 HELPER Iteration #$iteration: ${toolsResponse.tools.map { it.tool }}" }
+            
+            // Выполняем tools
+            val results = mutableListOf<String>()
+            for (toolCall in toolsResponse.tools) {
+                // Проверяем что tool доступен для HELPER
+                if (!helperToolNames.contains(toolCall.tool)) {
+                    logger.warn { "⚠️ HELPER: Tool ${toolCall.tool} не доступен" }
+                    results.add("📌 ${toolCall.tool}: ERROR - инструмент не доступен для HELPER")
+                    continue
+                }
+                
+                try {
+                    logger.info { "⚙️ HELPER: Вызов tool ${toolCall.tool}" }
+                    val argsAsAny: Map<String, Any> = toolCall.argsToMap()
+                    val result = mcpOrchestrator.callTool(toolCall.tool, argsAsAny)
+                    val resultText = result.content.firstOrNull()?.text ?: "No result"
+                    
+                    usedTools.add(toolCall.tool)
+                    results.add("📌 ${toolCall.tool}:\n$resultText")
+                    logger.info { "✅ HELPER: Tool ${toolCall.tool} выполнен" }
+                } catch (e: Exception) {
+                    logger.error(e) { "❌ HELPER: Ошибка вызова tool ${toolCall.tool}" }
+                    results.add("📌 ${toolCall.tool}: ERROR - ${e.message}")
+                }
+            }
+            
+            // Формируем сообщение с результатами
+            val formattedResult = """
+Результаты инструментов:
+
+${results.joinToString("\n\n")}
+
+🎯 ВАЖНО: 
+- Используй эту информацию для формирования ответов на запросы пользователей
+- Если нужна дополнительная информация - вызови ещё инструменты
+- Когда все ответы готовы - верни ПОЛНЫЙ JSON с заполненными answer (без markdown!)
+""".trimIndent()
+            
+            messages.add(HFMessage(role = "assistant", content = currentResponse))
+            messages.add(HFMessage(role = "user", content = formattedResult))
+            
+            logger.info { "🔄 HELPER: Повторный запрос к LLM..." }
+            currentResponse = aiClient.ask(messages)
+            logger.info { "📥 HELPER: Ответ получен (${currentResponse.length} chars)" }
+        }
+        
+        if (usedTools.isNotEmpty()) {
+            logger.info { "✅ HELPER: Использовано tools: ${usedTools.joinToString(" → ")}" }
+        }
+        
         return currentResponse
     }
 

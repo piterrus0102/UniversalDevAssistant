@@ -44,8 +44,11 @@ show_help() {
     echo -e "  ${BLUE}git${NC}                 Показать Git статус"
     echo -e "  ${BLUE}branch${NC}              Показать текущую ветку"
     echo -e "  ${BLUE}docs${NC}                Список документов"
+    echo -e "  ${BLUE}roles${NC}               Показать доступные роли"
+    echo -e "  ${BLUE}role${NC} <NAME>         Сменить роль (COMMON, HELPER)"
     echo -e "  ${BLUE}health${NC}              Проверка работоспособности"
     echo -e "  ${BLUE}reindex${NC}             Переиндексация документации"
+    echo -e "  ${BLUE}support${NC}             Обработать запросы поддержки (только HELPER)"
     echo -e "  ${BLUE}help${NC}                Показать эту справку"
     echo ""
     echo -e "${YELLOW}💬 Интерактивный режим:${NC}"
@@ -56,8 +59,11 @@ show_help() {
     echo -e "    ${BLUE}/git${NC}              Git статус"
     echo -e "    ${BLUE}/branch${NC}           Текущая ветка"
     echo -e "    ${BLUE}/docs${NC}             Список документов"
+    echo -e "    ${BLUE}/roles${NC}            Показать роли"
+    echo -e "    ${BLUE}/role${NC} <NAME>      Сменить роль"
     echo -e "    ${BLUE}/health${NC}           Проверка сервера"
     echo -e "    ${BLUE}/reindex${NC}          Переиндексация документации"
+    echo -e "    ${BLUE}/support${NC}          Обработать запросы поддержки (HELPER)"
     echo -e "    ${BLUE}/exit${NC}             Выход"
     echo ""
     echo -e "    ${GREEN}Без /${NC} - просто задать вопрос AI"
@@ -233,6 +239,148 @@ show_health() {
     echo -e "${GREEN}✅ Сервер работает нормально${NC}"
 }
 
+# Показать роли ассистента
+show_roles() {
+    echo -e "${CYAN}📋 Роли ассистента${NC}"
+    echo ""
+
+    RESPONSE=$(curl -s "$SERVER_URL/roles")
+
+    if [ -z "$RESPONSE" ]; then
+        echo -e "${RED}❌ Сервер не отвечает${NC}"
+        exit 1
+    fi
+
+    CURRENT_ROLE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('currentRole',''))" 2>/dev/null)
+    
+    echo -e "${YELLOW}Текущая роль:${NC} ${GREEN}$CURRENT_ROLE${NC}"
+    echo ""
+    echo -e "${YELLOW}Доступные роли:${NC}"
+    
+    # Извлекаем список ролей через Python
+    echo "$RESPONSE" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    roles = data.get('availableRoles', [])
+    current = data.get('currentRole', '')
+    for role in roles:
+        name = role.get('name', '')
+        desc = role.get('description', '')
+        marker = ' ✓' if name == current else ''
+        print(f\"  • {name}{marker} - {desc}\")
+except:
+    pass
+" 2>/dev/null
+    echo ""
+}
+
+# Сменить роль ассистента
+change_role() {
+    local role_name="$1"
+    
+    if [ -z "$role_name" ]; then
+        echo -e "${RED}❌ Укажите имя роли${NC}"
+        echo "Использование: ./scripts/assistant.sh role <ROLE_NAME>"
+        echo "Пример: ./scripts/assistant.sh role HELPER"
+        exit 1
+    fi
+    
+    echo -e "${CYAN}🔄 Смена роли на ${role_name}...${NC}"
+    echo ""
+    
+    RESPONSE=$(curl -s "$SERVER_URL/role/$role_name")
+    
+    if [ -z "$RESPONSE" ]; then
+        echo -e "${RED}❌ Сервер не отвечает${NC}"
+        exit 1
+    fi
+    
+    SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))" 2>/dev/null)
+    MESSAGE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',''))" 2>/dev/null)
+    PREV_ROLE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('previousRole',''))" 2>/dev/null)
+    NEW_ROLE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('newRole',''))" 2>/dev/null)
+    
+    if [ "$SUCCESS" == "True" ] || [ "$SUCCESS" == "true" ]; then
+        echo -e "${GREEN}✅ $MESSAGE${NC}"
+        echo -e "${YELLOW}Предыдущая роль:${NC} $PREV_ROLE"
+        echo -e "${YELLOW}Новая роль:${NC} ${GREEN}$NEW_ROLE${NC}"
+    else
+        echo -e "${RED}❌ $MESSAGE${NC}"
+    fi
+}
+
+# Получить текущую роль
+get_current_role() {
+    RESPONSE=$(curl -s "$SERVER_URL/role")
+    CURRENT_ROLE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('currentRole',''))" 2>/dev/null)
+    echo "$CURRENT_ROLE"
+}
+
+# Обработка запросов поддержки (только для HELPER)
+process_support() {
+    # Проверяем текущую роль
+    CURRENT_ROLE=$(get_current_role)
+    
+    if [ "$CURRENT_ROLE" != "HELPER" ]; then
+        echo -e "${YELLOW}⚠️  Команда /support доступна только в режиме HELPER${NC}"
+        echo ""
+        echo -e "Для переключения выполните:"
+        echo -e "  ${CYAN}/role HELPER${NC}"
+        echo ""
+        echo -e "Или из командной строки:"
+        echo -e "  ${CYAN}./scripts/assistant.sh role HELPER${NC}"
+        return
+    fi
+    
+    echo -e "${CYAN}🎫 Обработка запросов поддержки...${NC}"
+    echo ""
+    echo -e "${YELLOW}💭 Обрабатываю тикеты пользователей...${NC}"
+    echo ""
+    
+    RESPONSE=$(curl -s -X POST "$SERVER_URL/support")
+    
+    if [ -z "$RESPONSE" ]; then
+        echo -e "${RED}❌ Ошибка: нет ответа от сервера${NC}"
+        return
+    fi
+    
+    # Проверяем на ошибку
+    ERROR=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
+    
+    if [ ! -z "$ERROR" ] && [ "$ERROR" != "" ]; then
+        echo -e "${RED}❌ Ошибка: $ERROR${NC}"
+        return
+    fi
+    
+    echo -e "${GREEN}✅ Обработка закончена${NC}"
+    echo ""
+    echo -e "${YELLOW}📋 Результаты:${NC}"
+    echo ""
+    
+    # Выводим результаты через Python
+    echo "$RESPONSE" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    requests = data.get('requests', [])
+    for i, req in enumerate(requests, 1):
+        print(f\"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\")
+        print(f\"📌 Запрос #{i}\")
+        print(f\"   Пользователь: {req.get('userName', '')}\")
+        print(f\"   Дата: {req.get('date', '')}\")
+        print(f\"   Тема: {req.get('title', '')}\")
+        print(f\"   Вопрос: {req.get('message', '')}\")
+        print(f\"   \")
+        print(f\"   💬 Ответ: {req.get('answer', 'Нет ответа')}\")
+        print()
+except Exception as e:
+    print(f'Ошибка парсинга: {e}')
+" 2>/dev/null
+    
+    echo -e "${BLUE}💾 Ответы сохранены в: src/main/kotlin/server/helper/answers.json${NC}"
+}
+
 # Переиндексация документации
 reindex_docs() {
     echo -e "${CYAN}🔄 Переиндексация документации${NC}"
@@ -267,7 +415,7 @@ interactive_mode() {
     echo -e "${CYAN}║${NC}  ${YELLOW}Интерактивный режим${NC}                                 ${CYAN}║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "💡 Команды: ${BLUE}/help${NC} ${BLUE}/git${NC} ${BLUE}/docs${NC} ${BLUE}/branch${NC} ${BLUE}/health${NC} ${BLUE}/reindex${NC} ${BLUE}/exit${NC}"
+    echo -e "💡 Команды: ${BLUE}/help${NC} ${BLUE}/git${NC} ${BLUE}/docs${NC} ${BLUE}/roles${NC} ${BLUE}/role${NC} ${BLUE}/support${NC} ${BLUE}/branch${NC} ${BLUE}/health${NC} ${BLUE}/reindex${NC} ${BLUE}/exit${NC}"
     echo -e "💬 Просто напишите вопрос чтобы спросить AI"
     echo ""
     
@@ -309,14 +457,29 @@ interactive_mode() {
             /health)
                 show_health
                 ;;
+            /roles)
+                show_roles
+                ;;
+            /role\ *)
+                # /role HELPER -> извлекаем имя роли
+                role_name="${input#/role }"
+                change_role "$role_name"
+                ;;
+            /role)
+                # Просто /role без аргумента - показываем текущую роль
+                show_roles
+                ;;
             /reindex|/r)
                 reindex_docs
+                ;;
+            /support|/s)
+                process_support
                 ;;
             /*)
                 # Неизвестная команда с /
                 command="${input#/}"
                 echo -e "${RED}❌ Неизвестная команда: /$command${NC}"
-                echo -e "Доступные команды: ${BLUE}/help /git /branch /docs /health /reindex /exit${NC}"
+                echo -e "Доступные команды: ${BLUE}/help /git /branch /docs /roles /role /support /health /reindex /exit${NC}"
                 ;;
             *)
                 # Это вопрос к AI
@@ -354,11 +517,20 @@ main() {
         docs)
             show_docs
             ;;
+        roles)
+            show_roles
+            ;;
+        role)
+            change_role "$1"
+            ;;
         health)
             show_health
             ;;
         reindex)
             reindex_docs
+            ;;
+        support)
+            process_support
             ;;
         help|--help|-h)
             show_help

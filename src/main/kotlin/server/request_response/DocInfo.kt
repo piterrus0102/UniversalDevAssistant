@@ -1,4 +1,4 @@
-package server
+package server.request_response
 
 import kotlinx.serialization.Serializable
 

@@ -8,6 +8,7 @@ import mu.KotlinLogging
 import rag.OllamaClient
 import rag.RAGService
 import rag.Reranker
+import server.AssistantRole
 import server.AssistantServer
 import kotlin.system.exitProcess
 
@@ -133,10 +134,21 @@ fun main() {
         println("📂 Проект: ${config.project.name}")
         println("🌐 Сервер: http://${config.server.host}:${config.server.port}")
         println()
+        
+        // Выводим доступные роли
+        AssistantRole.printAvailableRoles()
+        
+        println("Управление ролями:")
+        println("  GET  /roles       - список всех ролей")
+        println("  GET  /role        - текущая роль")
+        println("  GET  /role/HELPER - сменить роль на HELPER")
+        println("  POST /role        - сменить роль {\"role\": \"HELPER\"}")
+        println()
         println("Примеры использования:")
         println("  curl 'http://localhost:${config.server.port}/help?q=структура проекта'")
         println("  curl http://localhost:${config.server.port}/git/status")
         println("  curl http://localhost:${config.server.port}/docs")
+        println("  curl http://localhost:${config.server.port}/role/HELPER")
         println("=" .repeat(80))
         println()
         
