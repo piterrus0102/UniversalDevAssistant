@@ -83,6 +83,32 @@ class LocalMCP(
                         ),
                         required = listOf("query")
                     )
+                ),
+                // ============================================================================
+                // Инструменты для работы с задачами (тикетами)
+                // ============================================================================
+                MCPTool(
+                    name = READ_ANSWERS_FILE_TOOL_NAME,
+                    description = "Читает файл с ОТВЕТАМИ службы поддержки. " +
+                                  "Содержит обращения пользователей и ответы на них. " +
+                                  "Используй когда нужно проанализировать обращения для создания задач на разработку.",
+                    inputSchema = MCPToolSchema(
+                        type = "object",
+                        properties = emptyMap(),
+                        required = emptyList()
+                    )
+                ),
+                MCPTool(
+                    name = READ_TICKETS_FILE_TOOL_NAME,
+                    description = "Читает файл с ЗАДАЧАМИ (тикетами) на разработку. " +
+                                  "Содержит тикеты с полями: id, title, text, suggestiveTechnicalDecision, priority. " +
+                                  "Используй когда нужно получить, отредактировать или удалить существующие задачи. " +
+                                  "Это единственный источник данных о задачах - они хранятся отдельно от проекта.",
+                    inputSchema = MCPToolSchema(
+                        type = "object",
+                        properties = emptyMap(),
+                        required = emptyList()
+                    )
                 )
             )
         )
@@ -275,6 +301,70 @@ class LocalMCP(
                 }
             }
             
+            // ============================================================================
+            // Обработчики инструментов для работы с задачами (тикетами)
+            // ============================================================================
+            
+            READ_ANSWERS_FILE_TOOL_NAME -> {
+                logger.info { "📋 Чтение файла answers.json..." }
+                
+                val answersFile = java.io.File("src/main/kotlin/server/helper/answers.json")
+                
+                if (!answersFile.exists()) {
+                    MCPToolResult(
+                        content = listOf(
+                            MCPContent(
+                                type = MCPContentType.text,
+                                text = "❌ Файл answers.json не найден.\n" +
+                                       "Сначала нужно обработать запросы пользователей через /support endpoint."
+                            )
+                        )
+                    )
+                } else {
+                    val content = answersFile.readText()
+                    logger.info { "✅ answers.json прочитан (${content.length} chars)" }
+                    
+                    MCPToolResult(
+                        content = listOf(
+                            MCPContent(
+                                type = MCPContentType.text,
+                                text = "📋 Содержимое answers.json:\n\n$content"
+                            )
+                        )
+                    )
+                }
+            }
+            
+            READ_TICKETS_FILE_TOOL_NAME -> {
+                logger.info { "🎫 Чтение файла tickets.json..." }
+                
+                val ticketsFile = java.io.File("src/main/kotlin/server/helper/tickets.json")
+                
+                if (!ticketsFile.exists()) {
+                    MCPToolResult(
+                        content = listOf(
+                            MCPContent(
+                                type = MCPContentType.text,
+                                text = "📋 Файл tickets.json пуст или не существует.\n" +
+                                       "Задач пока нет. Верни пустой массив tickets: []"
+                            )
+                        )
+                    )
+                } else {
+                    val content = ticketsFile.readText()
+                    logger.info { "✅ tickets.json прочитан (${content.length} chars)" }
+                    
+                    MCPToolResult(
+                        content = listOf(
+                            MCPContent(
+                                type = MCPContentType.text,
+                                text = "🎫 Содержимое tickets.json:\n\n$content"
+                            )
+                        )
+                    )
+                }
+            }
+            
             else -> {
                 throw IllegalArgumentException("Неизвестный инструмент: $name")
             }
@@ -453,6 +543,10 @@ class LocalMCP(
         const val REINDEX_DOCUMENTS_TOOL_NAME = "reindex_documents"
         const val RERANK_SEARCH_TOOL_NAME = "rerank_search"
         const val READ_PROJECT_FILE_TOOL_NAME = "read_project_file"
+        
+        // Инструменты для работы с задачами
+        const val READ_ANSWERS_FILE_TOOL_NAME = "read_answers_file"
+        const val READ_TICKETS_FILE_TOOL_NAME = "read_tickets_file"
     }
 }
 

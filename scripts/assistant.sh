@@ -3,6 +3,10 @@
 # Universal Dev Assistant CLI
 # Удобный интерфейс командной строки для AI-ассистента
 
+# Устанавливаем UTF-8 локаль для корректной работы с русским языком
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+
 # Переходим в корень проекта (на уровень выше scripts/)
 cd "$(dirname "$0")/.." || exit 1
 
@@ -51,6 +55,11 @@ show_help() {
     echo -e "  ${BLUE}support${NC}             Обработать запросы поддержки (только HELPER)"
     echo -e "  ${BLUE}help${NC}                Показать эту справку"
     echo ""
+    echo -e "${YELLOW}Управление задачами (режим COMMON):${NC}"
+    echo -e "  ${BLUE}create_tasks${NC}                        Создать задачи из answers.json"
+    echo -e "  ${BLUE}edit_task${NC} <id> [text=\"...\"] [title=\"...\"]  Редактировать задачу"
+    echo -e "  ${BLUE}delete_task${NC} <id или описание>       Удалить задачу"
+    echo ""
     echo -e "${YELLOW}💬 Интерактивный режим:${NC}"
     echo -e "  ${GREEN}./scripts/assistant.sh${NC}         Запустить интерактивную консоль"
     echo ""
@@ -64,6 +73,9 @@ show_help() {
     echo -e "    ${BLUE}/health${NC}           Проверка сервера"
     echo -e "    ${BLUE}/reindex${NC}          Переиндексация документации"
     echo -e "    ${BLUE}/support${NC}          Обработать запросы поддержки (HELPER)"
+    echo -e "    ${BLUE}/create_tasks${NC}     Создать задачи из answers.json"
+    echo -e "    ${BLUE}/edit_task${NC}        Редактировать задачу"
+    echo -e "    ${BLUE}/delete_task${NC}      Удалить задачу"
     echo -e "    ${BLUE}/exit${NC}             Выход"
     echo ""
     echo -e "    ${GREEN}Без /${NC} - просто задать вопрос AI"
@@ -381,6 +393,143 @@ except Exception as e:
     echo -e "${BLUE}💾 Ответы сохранены в: src/main/kotlin/server/helper/answers.json${NC}"
 }
 
+# ============================================================================
+# Команды управления задачами (тикетами)
+# ============================================================================
+
+# Создать задачи на основе answers.json
+create_tasks() {
+    echo -e "${CYAN}🎫 Создание задач на основе обращений пользователей...${NC}"
+    echo ""
+    echo -e "${YELLOW}💭 Анализирую answers.json и создаю тикеты...${NC}"
+    echo ""
+    
+    RESPONSE=$(curl -s --get --data-urlencode "q=/create_tasks" "$SERVER_URL/help")
+    
+    if [ -z "$RESPONSE" ]; then
+        echo -e "${RED}❌ Ошибка: нет ответа от сервера${NC}"
+        return
+    fi
+    
+    ANSWER=$(echo "$RESPONSE" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(data.get('answer', ''))
+except:
+    print('')
+" 2>/dev/null)
+    
+    if [ -z "$ANSWER" ]; then
+        echo -e "${RED}❌ Ошибка в ответе сервера${NC}"
+        echo "$RESPONSE"
+        return
+    fi
+    
+    echo -e "${GREEN}✅ Результат:${NC}"
+    echo ""
+    echo "$ANSWER"
+    echo ""
+    echo -e "${BLUE}💾 Задачи сохранены в: src/main/kotlin/server/helper/tickets.json${NC}"
+}
+
+# Редактировать задачу
+edit_task() {
+    local args="$*"
+    
+    if [ -z "$args" ]; then
+        echo -e "${RED}❌ Укажите ID задачи и параметры для изменения${NC}"
+        echo ""
+        echo -e "${YELLOW}Использование:${NC}"
+        echo -e "  ${GREEN}./scripts/assistant.sh edit_task${NC} <id> [text=\"новый текст\"] [title=\"новый заголовок\"]"
+        echo ""
+        echo -e "${YELLOW}Примеры:${NC}"
+        echo -e "  ${CYAN}edit_task abc-123 text=\"Обновленное описание\"${NC}"
+        echo -e "  ${CYAN}edit_task abc-123 title=\"Новый заголовок\" text=\"Новое описание\"${NC}"
+        echo -e "  ${CYAN}edit_task \"мобильное приложение\" text=\"Срочно нужно\"${NC}"
+        return
+    fi
+    
+    echo -e "${CYAN}✏️  Редактирование задачи...${NC}"
+    echo ""
+    echo -e "${YELLOW}💭 Обрабатываю запрос: /edit_task $args${NC}"
+    echo ""
+    
+    RESPONSE=$(curl -s --get --data-urlencode "q=/edit_task $args" "$SERVER_URL/help")
+    
+    if [ -z "$RESPONSE" ]; then
+        echo -e "${RED}❌ Ошибка: нет ответа от сервера${NC}"
+        return
+    fi
+    
+    ANSWER=$(echo "$RESPONSE" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(data.get('answer', ''))
+except:
+    print('')
+" 2>/dev/null)
+    
+    if [ -z "$ANSWER" ]; then
+        echo -e "${RED}❌ Ошибка в ответе сервера${NC}"
+        echo "$RESPONSE"
+        return
+    fi
+    
+    echo -e "${GREEN}✅ Результат:${NC}"
+    echo ""
+    echo "$ANSWER"
+}
+
+# Удалить задачу
+delete_task() {
+    local args="$*"
+    
+    if [ -z "$args" ]; then
+        echo -e "${RED}❌ Укажите ID задачи или её описание${NC}"
+        echo ""
+        echo -e "${YELLOW}Использование:${NC}"
+        echo -e "  ${GREEN}./scripts/assistant.sh delete_task${NC} <id или описание>"
+        echo ""
+        echo -e "${YELLOW}Примеры:${NC}"
+        echo -e "  ${CYAN}delete_task abc-123-def-456${NC}"
+        echo -e "  ${CYAN}delete_task \"мобильное приложение\"${NC}"
+        return
+    fi
+    
+    echo -e "${CYAN}🗑️  Удаление задачи...${NC}"
+    echo ""
+    echo -e "${YELLOW}💭 Обрабатываю запрос: /delete_task $args${NC}"
+    echo ""
+    
+    RESPONSE=$(curl -s --get --data-urlencode "q=/delete_task $args" "$SERVER_URL/help")
+    
+    if [ -z "$RESPONSE" ]; then
+        echo -e "${RED}❌ Ошибка: нет ответа от сервера${NC}"
+        return
+    fi
+    
+    ANSWER=$(echo "$RESPONSE" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(data.get('answer', ''))
+except:
+    print('')
+" 2>/dev/null)
+    
+    if [ -z "$ANSWER" ]; then
+        echo -e "${RED}❌ Ошибка в ответе сервера${NC}"
+        echo "$RESPONSE"
+        return
+    fi
+    
+    echo -e "${GREEN}✅ Результат:${NC}"
+    echo ""
+    echo "$ANSWER"
+}
+
 # Переиндексация документации
 reindex_docs() {
     echo -e "${CYAN}🔄 Переиндексация документации${NC}"
@@ -415,7 +564,7 @@ interactive_mode() {
     echo -e "${CYAN}║${NC}  ${YELLOW}Интерактивный режим${NC}                                 ${CYAN}║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "💡 Команды: ${BLUE}/help${NC} ${BLUE}/git${NC} ${BLUE}/docs${NC} ${BLUE}/roles${NC} ${BLUE}/role${NC} ${BLUE}/support${NC} ${BLUE}/branch${NC} ${BLUE}/health${NC} ${BLUE}/reindex${NC} ${BLUE}/exit${NC}"
+    echo -e "💡 Команды: ${BLUE}/help${NC} ${BLUE}/git${NC} ${BLUE}/docs${NC} ${BLUE}/roles${NC} ${BLUE}/role${NC} ${BLUE}/support${NC} ${BLUE}/create_tasks${NC} ${BLUE}/edit_task${NC} ${BLUE}/delete_task${NC} ${BLUE}/exit${NC}"
     echo -e "💬 Просто напишите вопрос чтобы спросить AI"
     echo ""
     
@@ -428,13 +577,8 @@ interactive_mode() {
         fi
         
         # Удаляем пробелы в начале и конце
-        input=$(echo "$input" | xargs)
-        
-        # Если это команда (начинается с /) - очищаем от невидимых байтов
-        if [[ "$input" == /* ]]; then
-            # Удаляем все байты кроме ASCII печатаемых и /
-            input=$(echo "$input" | LC_ALL=C tr -cd '[:print:]' | xargs)
-        fi
+        input="${input#"${input%%[![:space:]]*}"}"
+        input="${input%"${input##*[![:space:]]}"}"
         
         # Проверяем команды (с / и без)
         case "$input" in
@@ -475,11 +619,46 @@ interactive_mode() {
             /support|/s)
                 process_support
                 ;;
+            /create_tasks|/ct)
+                create_tasks
+                ;;
+            /edit_task*|/et\ *)
+                # /edit_task abc-123 text="..." -> извлекаем аргументы
+                if [[ "$input" == /edit_task* ]]; then
+                    task_args="${input#/edit_task}"
+                    task_args="${task_args# }"
+                else
+                    task_args="${input#/et }"
+                fi
+                if [ -z "$task_args" ]; then
+                    edit_task
+                else
+                    edit_task "$task_args"
+                fi
+                ;;
+            /delete_task*|/dt\ *)
+                # /delete_task abc-123 или /delete_task "описание" -> извлекаем аргументы
+                if [[ "$input" == /delete_task* ]]; then
+                    # Убираем /delete_task и пробелы в начале
+                    task_args="${input#/delete_task}"
+                    task_args="${task_args# }"
+                else
+                    task_args="${input#/dt }"
+                fi
+                # Убираем кавычки если есть
+                task_args="${task_args%\"}"
+                task_args="${task_args#\"}"
+                if [ -z "$task_args" ]; then
+                    delete_task
+                else
+                    delete_task "$task_args"
+                fi
+                ;;
             /*)
                 # Неизвестная команда с /
                 command="${input#/}"
                 echo -e "${RED}❌ Неизвестная команда: /$command${NC}"
-                echo -e "Доступные команды: ${BLUE}/help /git /branch /docs /roles /role /support /health /reindex /exit${NC}"
+                echo -e "Доступные команды: ${BLUE}/help /git /branch /docs /roles /role /support /create_tasks /edit_task /delete_task /health /reindex /exit${NC}"
                 ;;
             *)
                 # Это вопрос к AI
@@ -531,6 +710,15 @@ main() {
             ;;
         support)
             process_support
+            ;;
+        create_tasks|ct)
+            create_tasks
+            ;;
+        edit_task|et)
+            edit_task "$@"
+            ;;
+        delete_task|dt)
+            delete_task "$@"
             ;;
         help|--help|-h)
             show_help

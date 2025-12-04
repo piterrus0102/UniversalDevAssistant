@@ -249,8 +249,16 @@ class AssistantServer(
                     logger.info { "❓ Вопрос: $question" }
                     
                     try {
-                        val answer = runBlocking {
-                            callLLMWithTools(question)
+                        // Проверяем - это команда управления задачами?
+                        val answer = if (isTaskManagementCommand(question)) {
+                            logger.info { "🎫 Обнаружена команда управления задачами: $question" }
+                            runBlocking {
+                                callTaskManagementLLM(question)
+                            }
+                        } else {
+                            runBlocking {
+                                callLLMWithTools(question)
+                            }
                         }
                         
                         logger.info { "✅ Ответ сформирован (${answer.length} chars)" }
@@ -730,6 +738,264 @@ class AssistantServer(
     }
     
     /**
+     * Проверка - является ли сообщение командой управления задачами
+     */
+    private fun isTaskManagementCommand(message: String): Boolean {
+        val trimmed = message.trim().lowercase()
+        return trimmed.startsWith("/create_tasks") ||
+               trimmed.startsWith("/edit_task") ||
+               trimmed.startsWith("/delete_task")
+    }
+    
+    /**
+     * Вызов LLM для команд управления задачами
+     * 
+     * Обрабатывает команды:
+     * - /create_tasks - создание задач на основе answers.json
+     * - /edit_task <id или описание> <text> <title>
+     * - /delete_task <id или описание>
+     */
+    private suspend fun callTaskManagementLLM(command: String): String {
+        logger.info { "🎫 Обработка команды управления задачами: $command" }
+        
+        // Парсим команду и аргументы
+        val parts = command.trim().split(" ", limit = 2)
+        val commandName = parts[0]
+        val commandArgs = if (parts.size > 1) parts[1] else ""
+        
+        // Собираем ТОЛЬКО нужные tools для task management (не все 50!)
+        val allTools = mcpOrchestrator.getAllTools()
+        val tools = when {
+            commandName == "/create_tasks" -> allTools.filter { 
+                it.name == "read_answers_file" 
+            }
+            commandName == "/edit_task" || commandName == "/delete_task" -> allTools.filter { 
+                it.name == "read_tickets_file" 
+            }
+            else -> allTools.filter {
+                it.name == "read_tickets_file" || it.name == "read_answers_file"
+            }
+        }
+        
+        logger.info { "🔧 Task Management: отфильтровано ${tools.size} инструментов из ${allTools.size}" }
+        
+        // Формируем system prompt для управления задачами
+        val systemPrompt = SystemPrompts.createTaskManagementSystemMessage(config, tools, commandName, commandArgs)
+        
+        val messages = mutableListOf(
+            HFMessage(role = "system", content = systemPrompt),
+            HFMessage(role = "user", content = command)
+        )
+        
+        var currentResponse = aiClient.ask(messages)
+        logger.info { "📥 Ответ LLM получен" }
+        
+        val usedTools = mutableListOf<String>()
+        val allToolNames = tools.map { it.name }
+        var iteration = 0
+        val maxIterations = 10
+        
+        // Tool calling loop
+        while (iteration < maxIterations) {
+            iteration++
+            
+            // Парсим tool calls
+            val toolsResponse = try {
+                json.decodeFromString<ToolsResponse>(currentResponse)
+            } catch (e: Exception) {
+                try {
+                    val singleTool = json.decodeFromString<ToolCall>(currentResponse)
+                    ToolsResponse(tools = listOf(singleTool))
+                } catch (e2: Exception) {
+                    logger.debug { "Нет tool вызовов, проверяем на финальный JSON" }
+                    break
+                }
+            }
+            
+            if (toolsResponse.tools.isEmpty()) {
+                logger.debug { "Пустой массив tools, финальный ответ" }
+                break
+            }
+            
+            logger.info { "🔧 Task Management Iteration #$iteration: ${toolsResponse.tools.map { it.tool }}" }
+            
+            // Выполняем tools
+            val results = mutableListOf<String>()
+            for (toolCall in toolsResponse.tools) {
+                if (!allToolNames.contains(toolCall.tool)) {
+                    results.add("📌 ${toolCall.tool}: ERROR - инструмент не существует")
+                    continue
+                }
+                
+                try {
+                    logger.info { "⚙️ Вызов tool: ${toolCall.tool}" }
+                    val argsAsAny: Map<String, Any> = toolCall.argsToMap()
+                    val result = mcpOrchestrator.callTool(toolCall.tool, argsAsAny)
+                    val resultText = result.content.firstOrNull()?.text ?: "No result"
+                    
+                    usedTools.add(toolCall.tool)
+                    results.add("📌 ${toolCall.tool}:\n$resultText")
+                    logger.info { "✅ Tool ${toolCall.tool} выполнен (${resultText.length} chars)" }
+                } catch (e: Exception) {
+                    logger.error(e) { "❌ Ошибка вызова tool ${toolCall.tool}" }
+                    results.add("📌 ${toolCall.tool}: ERROR - ${e.message}")
+                }
+            }
+            
+            // Формируем сообщение с результатами
+            val formattedResult = """
+Результаты инструментов:
+
+${results.joinToString("\n\n")}
+
+🎯 Продолжай выполнение задачи. Если нужны ещё инструменты - вызови их.
+Когда задача завершена - верни финальный JSON ответ.
+""".trimIndent()
+            
+            messages.add(HFMessage(role = "assistant", content = currentResponse))
+            messages.add(HFMessage(role = "user", content = formattedResult))
+            
+            logger.info { "🔄 Повторный запрос к LLM..." }
+            currentResponse = aiClient.ask(messages)
+            logger.info { "📥 Ответ получен (${currentResponse.length} chars)" }
+        }
+        
+        if (usedTools.isNotEmpty()) {
+            logger.info { "✅ Task Management: Использовано tools: ${usedTools.joinToString(" → ")}" }
+        }
+        
+        // Для /create_tasks - парсим JSON и сохраняем tickets.json
+        if (commandName == "/create_tasks") {
+            return processCreateTasksResponse(currentResponse)
+        }
+        
+        // Для /edit_task и /delete_task - тоже сохраняем результат
+        if (commandName == "/edit_task" || commandName == "/delete_task") {
+            return processModifyTasksResponse(currentResponse)
+        }
+        
+        return currentResponse
+    }
+    
+    /**
+     * Обработка ответа LLM для /create_tasks
+     * Парсит JSON с тикетами и сохраняет в tickets.json
+     */
+    private fun processCreateTasksResponse(response: String): String {
+        logger.info { "💾 Обработка ответа /create_tasks и сохранение tickets.json..." }
+        
+        try {
+            // Очищаем ответ от markdown
+            val cleanedResponse = response
+                .replace("```json", "")
+                .replace("```", "")
+                .trim()
+            
+            // Десериализуем JSON в модель
+            val jsonParser = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+            val createResponse = jsonParser.decodeFromString<CreateTasksResponse>(cleanedResponse)
+            
+            val container = server.helper.TicketsContainer(tickets = createResponse.tickets)
+            
+            // Сохраняем в файл
+            val ticketsFile = java.io.File("src/main/kotlin/server/helper/tickets.json")
+            val prettyJson = Json { prettyPrint = true; encodeDefaults = true }
+            ticketsFile.writeText(prettyJson.encodeToString(server.helper.TicketsContainer.serializer(), container))
+            
+            logger.info { "✅ tickets.json сохранён (${createResponse.tickets.size} тикетов)" }
+            
+            // Формируем текстовый отчёт
+            val tickets = createResponse.tickets
+            val analyzed = createResponse.summary?.analyzed ?: 0
+            val created = tickets.size
+            val skipped = createResponse.summary?.skipped ?: (analyzed - created)
+            
+            // Группируем по приоритету
+            val highPriority = tickets.filter { it.priority == "HIGH" }
+            val normalPriority = tickets.filter { it.priority == "NORMAL" }
+            val lowPriority = tickets.filter { it.priority == "LOW" }
+            
+            val report = buildString {
+                appendLine("✅ Задачи успешно созданы!")
+                appendLine()
+                appendLine("📊 Статистика:")
+                appendLine("   • Проанализировано обращений: $analyzed")
+                appendLine("   • Создано тикетов: $created")
+                appendLine("   • Пропущено (не требует разработки): $skipped")
+                appendLine()
+                appendLine("📌 По приоритету:")
+                appendLine("   🔴 HIGH: ${highPriority.size}")
+                appendLine("   🟡 NORMAL: ${normalPriority.size}")
+                appendLine("   🟢 LOW: ${lowPriority.size}")
+                appendLine()
+                if (tickets.isNotEmpty()) {
+                    appendLine("🎫 Созданные задачи:")
+                    tickets.forEachIndexed { index, ticket ->
+                        val priorityIcon = when(ticket.priority) {
+                            "HIGH" -> "🔴"
+                            "LOW" -> "🟢"
+                            else -> "🟡"
+                        }
+                        appendLine("   ${index + 1}. $priorityIcon ${ticket.title}")
+                        appendLine("      ID: ${ticket.id}")
+                        appendLine("      Приоритет: ${ticket.priority}")
+                        appendLine("      Решение: ${ticket.suggestiveTechnicalDecision.take(100)}...")
+                        appendLine()
+                    }
+                }
+                appendLine("💾 Файл сохранён: src/main/kotlin/server/helper/tickets.json")
+            }
+            
+            return report
+            
+        } catch (e: Exception) {
+            logger.error(e) { "❌ Ошибка парсинга ответа /create_tasks" }
+            
+            // Сохраняем сырой ответ для отладки
+            val rawFile = java.io.File("src/main/kotlin/server/helper/tickets_raw.txt")
+            rawFile.writeText(response)
+            
+            return "❌ Ошибка обработки ответа: ${e.message}\n\nСырой ответ сохранён в tickets_raw.txt для отладки.\n\nОтвет LLM:\n$response"
+        }
+    }
+    
+    /**
+     * Обработка ответа LLM для /edit_task и /delete_task
+     * Парсит JSON с тикетами и сохраняет в tickets.json
+     */
+    private fun processModifyTasksResponse(response: String): String {
+        logger.info { "💾 Обработка ответа edit/delete и сохранение tickets.json..." }
+        
+        try {
+            // Очищаем ответ от markdown
+            val cleanedResponse = response
+                .replace("```json", "")
+                .replace("```", "")
+                .trim()
+            
+            // Десериализуем JSON в модель
+            val jsonParser = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+            val modifyResponse = jsonParser.decodeFromString<ModifyTasksResponse>(cleanedResponse)
+            
+            val container = server.helper.TicketsContainer(tickets = modifyResponse.tickets)
+            
+            // Сохраняем в файл
+            val ticketsFile = java.io.File("src/main/kotlin/server/helper/tickets.json")
+            val prettyJson = Json { prettyPrint = true; encodeDefaults = true }
+            ticketsFile.writeText(prettyJson.encodeToString(server.helper.TicketsContainer.serializer(), container))
+            
+            logger.info { "✅ tickets.json обновлён (${modifyResponse.tickets.size} тикетов)" }
+            
+            return modifyResponse.message ?: "✅ Задачи обновлены. Всего тикетов: ${modifyResponse.tickets.size}"
+            
+        } catch (e: Exception) {
+            // Если не удалось распарсить как JSON - возвращаем текстовый ответ
+            logger.debug { "Ответ не является JSON, возвращаем как текст: ${e.message}" }
+            return response
+        }
+    }
+    
+    /**
      * Вызов LLM для HELPER роли (обработка запросов поддержки)
      * 
      * Использует только RAG и LocalMCP (без GitHubMCP).
@@ -870,6 +1136,31 @@ $rerankText
 // ============================================================================
 // Internal Models
 // ============================================================================
+
+/**
+ * Ответ LLM на /create_tasks
+ */
+@Serializable
+data class CreateTasksResponse(
+    val tickets: List<server.helper.Ticket>,
+    val summary: CreateTasksSummary? = null
+)
+
+@Serializable
+data class CreateTasksSummary(
+    val analyzed: Int = 0,
+    val created: Int = 0,
+    val skipped: Int = 0
+)
+
+/**
+ * Ответ LLM на /edit_task и /delete_task
+ */
+@Serializable
+data class ModifyTasksResponse(
+    val tickets: List<server.helper.Ticket>,
+    val message: String? = null
+)
 
 /**
  * Ответ с массивом tool calls от LLM
